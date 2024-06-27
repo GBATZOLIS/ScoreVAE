@@ -1,0 +1,3 @@
+#!/bin/bash
+set -e
+conda update -n base -c conda-forge conda -y
