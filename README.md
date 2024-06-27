@@ -13,10 +13,10 @@ You can find the paper on [arXiv](https://arxiv.org/abs/2212.12611) and more det
 
 ### Dependencies
 
-Run the following to install a subset of necessary python packages for our code
+Run the following to create the conda environment and install necessary packages:
 ```sh
-pip install -r requirements.txt
-```
+conda env create -f environment.yml
+conda activate id-diff
 
 ### Usage
 To train a diffusion model, use `train.py`. To extract the intrinsic dimension, use `eval.py`.
