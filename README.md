@@ -17,6 +17,7 @@ Run the following to create the conda environment and install necessary packages
 ```sh
 conda env create -f environment.yml
 conda activate id-diff
+```
 
 ### Usage
 To train a diffusion model, use `train.py`. To extract the intrinsic dimension, use `eval.py`.
