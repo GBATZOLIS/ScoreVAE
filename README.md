@@ -1,4 +1,4 @@
-Variational Diffusion Auto-encoder: Latent Space Extraction from Pre-trained Diffusion Models
+# **Variational Diffusion Auto-encoder: Latent Space Extraction from Pre-trained Diffusion Models**
 
 This repo is an implementation of the paper [Variational Diffusion Auto-encoder: Latent Space Extraction from Pre-trained Diffusion Models](https://arxiv.org/abs/2304.12141).
 
