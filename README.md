@@ -1,6 +1,6 @@
 Variational Diffusion Auto-encoder: Latent Space Extraction from Pre-trained Diffusion Models
 
-This repo is a clean and simplified reimplementation of the official PyTorch codebase for the paper [Variational Diffusion Auto-encoder: Latent Space Extraction from Pre-trained Diffusion Models](https://arxiv.org/abs/2304.12141).
+This repo is an implementation of the official PyTorch codebase for the paper [Variational Diffusion Auto-encoder: Latent Space Extraction from Pre-trained Diffusion Models](https://arxiv.org/abs/2304.12141).
 
 by Georgios Batzolis*, Jan Stanczuk*, Teo Deveney, and Carola-Bibiane Schönlieb
 
