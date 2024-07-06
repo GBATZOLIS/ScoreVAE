@@ -1,11 +1,8 @@
-# Diffusion Models Encode the Intrinsic Dimension of Data Manifolds
-![ICML 2024](https://img.shields.io/badge/ICML-2024-blue.svg)
+Variational Diffusion Auto-encoder: Latent Space Extraction from Pre-trained Diffusion Models
 
-This repo is a clean and simplified reimplementation of the official PyTorch codebase for the paper [Diffusion Models Encode the Intrinsic Dimension of Data Manifolds](https://arxiv.org/abs/2212.12611).
+This repo is a clean and simplified reimplementation of the official PyTorch codebase for the paper [Variational Diffusion Auto-encoder: Latent Space Extraction from Pre-trained Diffusion Models](https://arxiv.org/abs/2304.12141).
 
-by Jan Stanczuk*, Georgios Batzolis*, Teo Deveney, and Carola-Bibiane Schönlieb
-
-You can find the paper on [arXiv](https://arxiv.org/abs/2212.12611) and more details on the project's [website](https://gbatzolis.github.io/ID-diff/).
+by Georgios Batzolis*, Jan Stanczuk*, Teo Deveney, and Carola-Bibiane Schönlieb
 
 --------------------
 
@@ -20,19 +17,19 @@ conda activate id-diff
 ```
 
 ### Usage
-To train a diffusion model, use `train.py`. To extract the intrinsic dimension, use `eval.py`.
+To train a diffusion model, use `train.py`. To evaluate the model, use `eval.py`.
 
 ### Example
-For a complete description of how to train the model and extract the intrinsic dimension from the trained diffusion model, refer to `demo.ipynb`.
+For a complete description of how to train the model and use it for compression/manipulation/editing, refer to `demo.ipynb`.
 
 ## References
 
 If you find the code useful for your research, please consider citing
 ```bib
-@article{stanczuk2022your,
-  title={Your diffusion model secretly knows the dimension of the data manifold},
-  author={Stanczuk, Jan and Batzolis, Georgios and Deveney, Teo and Sch{\"o}nlieb, Carola-Bibiane},
-  journal={arXiv preprint arXiv:2212.12611},
-  year={2022}
+@article{batzolis2023variational,
+  title={Variational Diffusion Auto-encoder: Latent Space Extraction from Pre-trained Diffusion Models},
+  author={Batzolis, Georgios and Stanczuk, Jan and Sch{\"o}nlieb, Carola-Bibiane},
+  journal={arXiv preprint arXiv:2304.12141},
+  year={2023}
 }
 ```
