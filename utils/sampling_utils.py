@@ -5,10 +5,13 @@ from tqdm import tqdm
 import numpy as np
 from contextlib import contextmanager
 import abc
+import torchvision.utils as vutils
+import math
 
 # Set the Matplotlib backend to Agg
 import matplotlib
 matplotlib.use('Agg')
+
 
 def get_score_fn(sde, diffusion_model):
     def score_fn(x, y, t):
@@ -167,13 +170,49 @@ def generation_callback(y, writer, sde, diffusion_model, steps, shape, device, e
     #y is the condition. 
     samples = generate_samples(y, sde, diffusion_model, steps, shape, device)
     
-    if samples.shape[1] in [2, 3]:
-        # Plot the samples
-        fig, ax = plot_samples(samples)
+    if len(samples.shape[1:]) == 1: #euclidean data, i.e. shape=(batchsize, ambient_dim)
+        if samples.shape[1] in [2, 3]:
+            # Plot the samples
+            fig, ax = plot_samples(samples)
+            
+            # Save the plot to TensorBoard with epoch number in the tag
+            save_plot_to_tensorboard(writer, fig, f'Generated Samples/Epoch {epoch + 1}', epoch)
         
-        # Save the plot to TensorBoard with epoch number in the tag
-        save_plot_to_tensorboard(writer, fig, f'Generated Samples/Epoch {epoch + 1}', epoch)
-    
-    
-    # Plot and save the histogram of norms
-    plot_and_save_histogram_of_norms(samples, writer, epoch)
+        
+        # Plot and save the histogram of norms
+        plot_and_save_histogram_of_norms(samples, writer, epoch)
+    elif len(samples.shape[1:]) == 3: #assume images of shape (channels, width, height)
+        # samples is a batch of images of shape (batchsize, c, w, h)
+        num_rows = int(math.sqrt(samples.shape[0]))
+        
+        # Create a grid of images
+        grid = vutils.make_grid(samples, nrow=num_rows, normalize=True, scale_each=True)
+        
+        # Save the image grid to TensorBoard
+        writer.add_image(f'Generated Images', grid, epoch)
+
+def generate_specified_num_samples(num_samples, sde, diffusion_model, steps, shape, device):
+    with evaluation_mode(diffusion_model):
+        score_fn = get_score_fn(sde, diffusion_model)
+
+        with torch.no_grad():
+            all_samples = []
+            num_iterations = (num_samples + shape[0] - 1) // shape[0]  # Calculate the number of iterations required
+
+            for _ in tqdm(range(num_iterations), desc="Generating samples for FID evaluation"):
+                # Initial sample
+                x = sde.prior_sampling(shape).to(device).type(torch.float32)
+                timesteps = torch.linspace(sde.T, sde.sampling_eps, steps + 1, device=device)
+                predictor = EulerMaruyamaPredictor(sde, score_fn, probability_flow=False, discretisation=timesteps)
+
+                for i in range(steps):
+                    t = timesteps[i]
+                    vec_t = torch.ones(shape[0], device=t.device) * t
+                    x, x_mean = predictor.update_fn(x, None, vec_t)  # `None` is passed as `y` here assuming unconditional generation
+
+                all_samples.append(x_mean.cpu().numpy())  # Move to CPU immediately after generation
+
+            all_samples = np.concatenate(all_samples, axis=0)
+            all_samples = all_samples[:num_samples]  # Discard redundant samples to get exactly `num_samples`
+
+    return all_samples

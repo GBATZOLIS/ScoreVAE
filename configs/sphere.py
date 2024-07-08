@@ -40,6 +40,7 @@ def get_config():
     data.embedding_type = 'random_isometry'
     data.radii = []
     data.angle_std = -1
+    data.shape = [data.ambient_dim]
 
     # Model settings
     config.model = model = ml_collections.ConfigDict()

@@ -6,7 +6,6 @@ import numpy as np
 import torch as th
 from torch import nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
 
 # Import necessary items from BeatGANs_choices.py
 from .BeatGANs_utils.BeatGANs_choices import ModelType
@@ -26,10 +25,10 @@ from .BeatGANs_utils.BeatGANs_nn import (
     zero_module, SiLU
 )
 
-class BeatGANsUNetModel(nn.Module):
-    def __init__(self, config):
+class BeatGANsUNet(nn.Module):
+    def __init__(self, model_config):
         super().__init__()
-        self.conf = config.model
+        self.conf = model_config
 
         if self.conf.num_heads_upsample == -1:
             self.num_heads_upsample = self.conf.num_heads
@@ -40,9 +39,6 @@ class BeatGANsUNetModel(nn.Module):
             nn.SiLU(),
             linear(self.conf.embed_channels, self.conf.embed_channels),
         )
-
-        if self.conf.num_classes is not None:
-            self.label_emb = nn.Embedding(self.conf.num_classes, self.conf.embed_channels)
 
         ch = input_ch = int(self.conf.channel_mult[0] * self.conf.model_channels)
         self.input_blocks = nn.ModuleList([
@@ -180,15 +176,11 @@ class BeatGANsUNetModel(nn.Module):
                 conv_nd(self.conf.dims, input_ch, self.conf.out_channels, 3, padding=1),
             )
 
-    def forward(self, x, t, y=None, **kwargs):
-        assert (y is not None) == (self.conf.num_classes is not None), "must specify y if and only if the model is class-conditional"
+    def forward(self, x, y, t):
         hs = [[] for _ in range(len(self.conf.channel_mult))]
         emb = self.time_embed(timestep_embedding(t, self.time_emb_channels))
 
-        if self.conf.num_classes is not None:
-            raise NotImplementedError()
-
-        h = x.type(self.dtype)
+        h = x  # No need to change type here
         k = 0
         for i in range(len(self.input_num_blocks)):
             for j in range(self.input_num_blocks[i]):
@@ -208,6 +200,6 @@ class BeatGANsUNetModel(nn.Module):
                 h = self.output_blocks[k](h, emb=emb, lateral=lateral)
                 k += 1
 
-        h = h.type(x.dtype)
         pred = self.out(h)
         return pred
+

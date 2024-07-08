@@ -14,13 +14,14 @@ def get_config():
     # Training settings
     config.training = training = ml_collections.ConfigDict()
     ## general training settings
-    training.device = "cpu"
+    training.device = "cuda:3"
     training.gpus = 1  # Number of GPUs to use
     training.epochs = 1000
     training.checkpoint_frequency = 20
     training.patience_epochs = 100
     ## settings for the generation callback during training
-    training.vis_frequency = 50 #generate data every vis_frequency epochs
+    training.vis_frequency = 5 #generate data every vis_frequency epochs
+    training.fid_eval_frequency = 500 #FID evaluation frequency
     training.steps = 128 #number of integration steps
     training.num_samples = 64 #number of samples to generate
     ## settings for forward SDE + loss function
@@ -38,7 +39,7 @@ def get_config():
 
     # Model settings
     config.model = model = ml_collections.ConfigDict()
-    model.network = 'BeatGANsUNetModel'
+    model.network = 'BeatGANsUNet'
     model.checkpoint_path = None
     model.model_channels = 128
     model.out_channels = data.num_channels
@@ -47,6 +48,7 @@ def get_config():
     model.attention_resolutions = (16,)
     model.dropout = 0.1
     model.channel_mult = (1, 1, 2, 4)
+    model.input_channel_mult = None
     model.conv_resample = True
     model.dims = 2
     model.use_checkpoint = False
@@ -60,7 +62,11 @@ def get_config():
     model.resnet_use_zero_module = True
     model.attn_checkpoint = False
     model.ema_decay = 0.9999
-    
+    model.time_embed_channels = None
+    model.num_input_res_blocks = None
+    model.image_size = data.image_size
+    model.in_channels = data.num_channels
+
     # Optimization settings
     config.optim = optim = ml_collections.ConfigDict()
     optim.weight_decay = 1e-5

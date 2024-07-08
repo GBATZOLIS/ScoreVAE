@@ -1,10 +1,10 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import argparse
-import os
 import pickle
 
 from data.data_utils import get_dataloaders
@@ -16,6 +16,7 @@ from utils.optim_utils import get_optimizer_and_scheduler
 from torch.distributions import Uniform
 from loss import get_loss_fn
 from configs import load_config
+from evaluation.fid import fid_evaluation_callback
 
 # This train script is used for training a (conditional) diffusion model.
 
@@ -27,7 +28,7 @@ def train(config):
     train_loader, val_loader, test_loader = get_dataloaders(config.data)
     
     # Create the model
-    model = get_model(config)
+    model = get_model(config.model)
     model = model.to(device)
     print_model_size(model)
 
@@ -85,13 +86,24 @@ def train(config):
         if (epoch + 1) % config.training.vis_frequency == 0:
             steps = config.training.steps
             num_samples = config.training.num_samples
-            shape = (num_samples, config.data.ambient_dim)
+            shape = (num_samples, *config.data.shape)
 
             data = next(iter(val_loader))
             batch = prepare_batch(data, device)
             _, y = batch
 
             generation_callback(y, writer, sde, model, steps, shape, device, epoch)
+
+        if (epoch + 1) % config.training.fid_eval_frequency == 0:
+            steps = config.training.steps
+            num_samples = config.training.num_samples
+            shape = (num_samples, *config.data.shape)
+
+            dataloaders = [train_loader, val_loader]
+            fid_evaluation_callback(writer, sde, model, steps, shape, device, epoch, dataloaders, train=True)
+            
+            dataloaders = [test_loader]
+            fid_evaluation_callback(writer, sde, model, steps, shape, device, epoch, dataloaders, train=False)
 
         ema_model.restore()
 
