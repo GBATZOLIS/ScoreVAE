@@ -22,8 +22,8 @@ def get_dataloaders(args):
             transforms.ToTensor(),
             transforms.Normalize((0.5,), (0.5,))
         ])
-        full_train_dataset = datasets.MNIST(root='./data', train=True, transform=transform, download=True)
-        test_dataset = datasets.MNIST(root='./data', train=False, transform=transform, download=True)
+        full_train_dataset = datasets.MNIST(root='./datasets', train=True, transform=transform, download=True)
+        test_dataset = datasets.MNIST(root='./datasets', train=False, transform=transform, download=True)
 
         # Split train dataset into train and val sets (90/10 split)
         train_size = int(0.9 * len(full_train_dataset))
@@ -35,8 +35,8 @@ def get_dataloaders(args):
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
-        full_train_dataset = datasets.CIFAR10(root='./data', train=True, transform=transform, download=True)
-        test_dataset = datasets.CIFAR10(root='./data', train=False, transform=transform, download=True)
+        full_train_dataset = datasets.CIFAR10(root='./datasets', train=True, transform=transform, download=True)
+        test_dataset = datasets.CIFAR10(root='./datasets', train=False, transform=transform, download=True)
 
         # Split train dataset into train and val sets (90/10 split)
         train_size = int(0.9 * len(full_train_dataset))
