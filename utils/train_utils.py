@@ -11,6 +11,31 @@ from contextlib import contextmanager
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
+def prepare_training_dirs(config):
+    # Set up logging directories
+    tensorboard_dir = config.tensorboard_dir
+    checkpoint_dir = config.checkpoint_dir
+    eval_dir = config.eval_dir
+    os.makedirs(tensorboard_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(eval_dir, exist_ok=True)
+    return tensorboard_dir, checkpoint_dir, eval_dir
+
+def prepare_batch(data, device):
+    if isinstance(data, torch.Tensor):
+        return [data.to(device), None]
+    elif isinstance(data, list):
+        if len(data) == 1:
+            return [data[0].to(device), None]
+        else:
+            return [item.to(device) for item in data]
+    else:
+        raise ValueError("Unsupported data type.")
+
+def print_model_size(model):
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Total number of parameters: {total_params}')
+
 class EMA:
     def __init__(self, model, decay):
         self.model = model
@@ -41,19 +66,6 @@ class EMA:
                 assert name in self.backup
                 param.data = self.backup[name]
         self.backup = {}
-
-class WarmUpScheduler:
-    def __init__(self, optimizer, target_lr, warmup_steps):
-        self.optimizer = optimizer
-        self.target_lr = target_lr
-        self.warmup_steps = warmup_steps
-        self.step_num = 0
-
-    def step(self):
-        self.step_num += 1
-        lr = self.target_lr * min(1.0, self.step_num / self.warmup_steps)
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
 
 def save_model(model, ema_model, epoch, loss, model_name, checkpoint_dir, best_checkpoints):
     def write_model(model, path, epoch, loss, is_ema=False):
@@ -112,8 +124,8 @@ def load_model(model, ema_model, checkpoint_path, model_name, is_ema=False):
 
 
 def get_score_fn(sde, diffusion_model):
-    def score_fn(x, t):
-        noise_prediction = diffusion_model(x, t)
+    def score_fn(x, y, t):
+        noise_prediction = diffusion_model(x, y, t)
         _, std = sde.marginal_prob(x, t)
         std = std.view(std.shape[0], *[1 for _ in range(len(x.shape) - 1)])  # Expand std to match the shape of noise_prediction
         score = -noise_prediction / std

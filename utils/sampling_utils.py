@@ -11,8 +11,8 @@ import matplotlib
 matplotlib.use('Agg')
 
 def get_score_fn(sde, diffusion_model):
-    def score_fn(x, t):
-        noise_prediction = diffusion_model(x, t)
+    def score_fn(x, y, t):
+        noise_prediction = diffusion_model(x, y, t)
         _, std = sde.marginal_prob(x, t)
         std = std.view(std.shape[0], *[1 for _ in range(len(x.shape) - 1)])  # Expand std to match the shape of noise_prediction
         score = -noise_prediction / std
@@ -52,7 +52,7 @@ class Predictor(abc.ABC):
             self.inverse_step_fn = get_inverse_step_fn(discretisation.cpu().numpy())
 
     @abc.abstractmethod
-    def update_fn(self, x, t):
+    def update_fn(self, x, y, t):
         """One update of the predictor.
         Args:
           x: A PyTorch tensor representing the current state
@@ -68,9 +68,9 @@ class EulerMaruyamaPredictor(Predictor):
         super().__init__(sde, score_fn, probability_flow, discretisation)
         self.probability_flow = probability_flow
 
-    def update_fn(self, x, t):
+    def update_fn(self, x, y, t):
         dt = torch.tensor(self.inverse_step_fn(t[0].cpu().item())).type_as(t) # dt = -(1-self.sde.sampling_eps) / self.rsde.N
-        drift, diffusion = self.rsde.sde(x, t)
+        drift, diffusion = self.rsde.sde(x, y, t)
         x_mean = x + drift * dt
       
         if self.probability_flow:
@@ -91,7 +91,7 @@ def evaluation_mode(model):
         if was_training:
             model.train()
 
-def generate_samples(sde, diffusion_model, steps, shape, device):
+def generate_samples(y, sde, diffusion_model, steps, shape, device):
     with evaluation_mode(diffusion_model):
         score_fn = get_score_fn(sde, diffusion_model)
 
@@ -104,7 +104,7 @@ def generate_samples(sde, diffusion_model, steps, shape, device):
             for i in tqdm(range(steps)):
                 t = timesteps[i]
                 vec_t = torch.ones(shape[0], device=t.device) * t
-                x, x_mean = predictor.update_fn(x, vec_t)
+                x, x_mean = predictor.update_fn(x, y, vec_t)
 
     return x_mean
 
@@ -163,8 +163,9 @@ def plot_and_save_histogram_of_norms(samples, writer, steps):
     # Save the histogram plot to TensorBoard
     save_plot_to_tensorboard(writer, fig, 'Histogram of Norms', steps)
 
-def generation_callback(writer, sde, diffusion_model, steps, shape, device, epoch):
-    samples = generate_samples(sde, diffusion_model, steps, shape, device)
+def generation_callback(y, writer, sde, diffusion_model, steps, shape, device, epoch):
+    #y is the condition. 
+    samples = generate_samples(y, sde, diffusion_model, steps, shape, device)
     
     if samples.shape[1] in [2, 3]:
         # Plot the samples

@@ -2,10 +2,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 import argparse
 import os
 import pickle
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from data.data_utils import get_dataloaders
 from models import get_model
@@ -17,19 +20,31 @@ from torch.distributions import Uniform
 from loss import get_loss_fn
 from configs import load_config
 
-# This train script is used for training a (conditional) diffusion model.
+def train(rank, world_size, config):
+    # Initialize process group for distributed training
+    if 'SLURM_PROCID' in os.environ:
+        rank = int(os.environ['SLURM_PROCID'])
+        dist.init_process_group(backend='nccl')
+    else:
+        dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
+    
+    torch.cuda.set_device(rank)
+    device = torch.device(f'cuda:{rank}')
 
-def train(config):
     tensorboard_dir, checkpoint_dir, eval_dir = prepare_training_dirs(config)
-    writer = SummaryWriter(log_dir=tensorboard_dir)
-    device = torch.device(config.training.device)
+    writer = SummaryWriter(log_dir=tensorboard_dir) if rank == 0 else None
 
     train_loader, val_loader, test_loader = get_dataloaders(config.data)
     
+    # Use DistributedSampler for training data
+    train_sampler = DistributedSampler(train_loader.dataset, num_replicas=world_size, rank=rank)
+    train_loader = DataLoader(train_loader.dataset, batch_size=config.data.batch_size, sampler=train_sampler)
+
     # Create the model
-    model = get_model(config)
-    model = model.to(device)
-    print_model_size(model)
+    model = get_model(config).to(device)
+    model = nn.parallel.DistributedDataParallel(model, device_ids=[rank])
+    if rank == 0:
+        print_model_size(model)
 
     sde = configure_sde(config)
     ema_model = EMA(model=model, decay=config.model.ema_decay)
@@ -48,7 +63,9 @@ def train(config):
     for epoch in range(config.training.epochs):
         model.train()
         train_loss = 0
-        for data in tqdm(train_loader, desc=f"Training Epoch {epoch + 1}/{config.training.epochs}"):
+        train_sampler.set_epoch(epoch)  # Ensure proper shuffling for each epoch
+
+        for data in tqdm(train_loader, desc=f"Training Epoch {epoch + 1}/{config.training.epochs}", disable=rank != 0):
             batch = prepare_batch(data, device)
 
             optimizer.zero_grad()
@@ -63,26 +80,29 @@ def train(config):
             scheduler.step()
 
             train_loss += loss.item()
-            writer.add_scalar('Loss/Train', loss.item(), global_step)
+            if rank == 0:
+                writer.add_scalar('Loss/Train', loss.item(), global_step)
             global_step += 1
 
         train_loss /= len(train_loader)
-        writer.add_scalar('Loss/Train_epoch', train_loss, epoch)
+        if rank == 0:
+            writer.add_scalar('Loss/Train_epoch', train_loss, epoch)
 
         ema_model.apply_shadow()
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for data in tqdm(val_loader, desc=f"Validation Epoch {epoch + 1}/{config.training.epochs}"):
+            for data in tqdm(val_loader, desc=f"Validation Epoch {epoch + 1}/{config.training.epochs}", disable=rank != 0):
                 batch = prepare_batch(data, device)
                 score_fn = get_score_fn(sde, model)
                 loss = loss_fn(score_fn, batch)
                 val_loss += loss.item()
 
         val_loss /= len(val_loader)
-        writer.add_scalar('Loss/Validation', val_loss, epoch)
+        if rank == 0:
+            writer.add_scalar('Loss/Validation', val_loss, epoch)
 
-        if (epoch + 1) % config.training.vis_frequency == 0:
+        if rank == 0 and (epoch + 1) % config.training.vis_frequency == 0:
             steps = config.training.steps
             num_samples = config.training.num_samples
             shape = (num_samples, config.data.ambient_dim)
@@ -102,27 +122,33 @@ def train(config):
             epochs_no_improve += 1
 
         if epochs_no_improve >= config.training.patience_epochs:
-            print(f"Early stopping at epoch {epoch + 1}")
+            if rank == 0:
+                print(f"Early stopping at epoch {epoch + 1}")
             break
 
-        if (epoch + 1) % config.training.checkpoint_frequency == 0:
+        if rank == 0 and (epoch + 1) % config.training.checkpoint_frequency == 0:
             save_model(model, ema_model, epoch, val_loss, "Model", checkpoint_dir, best_checkpoints)
 
-    writer.close()
+    if rank == 0:
+        writer.close()
 
+    dist.destroy_process_group()
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Training Script for Diffusion/Score Model")
     parser.add_argument("--config", type=str, required=True, help="Path to the configuration file.")
     args = parser.parse_args()
 
     config = load_config(args.config)
 
-    # Save configuration to a file
-    config_dir = os.path.join(config.base_log_dir, config.experiment)
-    os.makedirs(config_dir, exist_ok=True)
-    config_path = os.path.join(config_dir, 'config.pkl')
-    with open(config_path, 'wb') as f:
-        pickle.dump(config.to_dict(), f)
+    world_size = min(config.training.gpus, torch.cuda.device_count())
+    if 'SLURM_PROCID' in os.environ:
+        # Running on a SLURM cluster
+        rank = int(os.environ['SLURM_PROCID'])
+        train(rank, world_size, config)
+    else:
+        # Running locally with multiple GPUs
+        mp.spawn(train, args=(world_size, config), nprocs=world_size, join=True)
 
-    train(config)
+if __name__ == "__main__":
+    main()
