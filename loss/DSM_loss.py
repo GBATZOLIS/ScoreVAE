@@ -1,7 +1,9 @@
 import torch
+from utils.train_utils import get_score_fn
 
 def get_loss_fn(sde, t_dist, likelihood_weighting=False):
-    def loss_fn(score_fn, batch):
+    def loss_fn(model, batch):
+        score_fn = get_score_fn(sde, model)
         x, y = batch
         t = t_dist.sample((x.shape[0],)).type_as(x)
         n = torch.randn_like(x)

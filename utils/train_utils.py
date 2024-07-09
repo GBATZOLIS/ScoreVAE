@@ -67,13 +67,19 @@ class EMA:
                 param.data = self.backup[name]
         self.backup = {}
 
-def save_model(model, ema_model, epoch, loss, model_name, checkpoint_dir, best_checkpoints):
+def save_model(model, ema_model, epoch, loss, model_name, checkpoint_dir, best_checkpoints, global_step, best_val_loss, epochs_no_improve, optimizer, scheduler):
     def write_model(model, path, epoch, loss, is_ema=False):
         state_dict = model.state_dict() if not is_ema else ema_model.shadow
         torch.save({
             'epoch': epoch,
             'model_state_dict': state_dict,
             'loss': loss,
+            'global_step': global_step,
+            'best_checkpoints': best_checkpoints,
+            'best_val_loss': best_val_loss,
+            'epochs_no_improve': epochs_no_improve,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict()
         }, path)
     
     if not os.path.exists(checkpoint_dir):
@@ -109,19 +115,50 @@ def save_model(model, ema_model, epoch, loss, model_name, checkpoint_dir, best_c
             print(f"{model_name} EMA model saved at '{new_ema_checkpoint_path}'")
 
 
-
-def load_model(model, ema_model, checkpoint_path, model_name, is_ema=False):
+def load_model(model, ema_model, checkpoint_path, model_name, optimizer=None, scheduler=None, is_ema=False):
     checkpoint = torch.load(checkpoint_path)
     if is_ema:
         for name, data in checkpoint['model_state_dict'].items():
             ema_model.shadow[name].copy_(data)
     else:
         model.load_state_dict(checkpoint['model_state_dict'])
+    
     epoch = checkpoint['epoch']
     loss = checkpoint['loss']
+    global_step = checkpoint.get('global_step', 0)
+    best_checkpoints = checkpoint.get('best_checkpoints', [])
+    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+    epochs_no_improve = checkpoint.get('epochs_no_improve', 0)
+    
+    if optimizer and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if scheduler and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
     print(f"{model_name} {'EMA' if is_ema else ''} model loaded from '{checkpoint_path}', Epoch: {epoch}, Loss: {loss}")
-    return epoch, loss
+    
+    return epoch, loss, global_step, best_checkpoints, best_val_loss, epochs_no_improve
 
+
+def resume_training(config, model, ema_model, load_model_func, optimizer, scheduler):
+    if config.model.checkpoint:
+        checkpoint_path = config.model.checkpoint
+        if not os.path.isabs(checkpoint_path):
+            checkpoint_path = os.path.join(config.checkpoint_dir, checkpoint_path)
+        if not checkpoint_path.endswith('.pth'):
+            checkpoint_path += '.pth'
+        
+        # Load standard model
+        epoch, loss, global_step, best_checkpoints, best_val_loss, epochs_no_improve = load_model_func(model, ema_model, checkpoint_path, "Model", optimizer, scheduler, is_ema=False)
+        # Load EMA model
+        ema_checkpoint_path = checkpoint_path.replace('.pth', '_EMA.pth')
+        _, _, _, _, _, _ = load_model_func(model, ema_model, ema_checkpoint_path, "Model", is_ema=True)
+        
+        print(f"Resuming training from epoch {epoch + 1}")
+        return epoch + 1, global_step, best_checkpoints, best_val_loss, epochs_no_improve
+    else:
+        return 0, 0, [], float('inf'), 0
+    
 
 def get_score_fn(sde, diffusion_model):
     def score_fn(x, y, t):

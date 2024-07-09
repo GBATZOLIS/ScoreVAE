@@ -10,15 +10,13 @@ import pickle
 from data.data_utils import get_dataloaders
 from models import get_model
 from sde import configure_sde
-from utils.train_utils import prepare_training_dirs, prepare_batch, print_model_size, EMA, save_model, get_score_fn, eval_callback
+from utils.train_utils import prepare_training_dirs, prepare_batch, print_model_size, EMA, save_model, load_model, get_score_fn, eval_callback, resume_training
 from utils.sampling_utils import generation_callback
 from utils.optim_utils import get_optimizer_and_scheduler
 from torch.distributions import Uniform
 from loss import get_loss_fn
 from configs import load_config
 from evaluation.fid import fid_evaluation_callback
-
-# This train script is used for training a (conditional) diffusion model.
 
 def train(config):
     tensorboard_dir, checkpoint_dir, eval_dir = prepare_training_dirs(config)
@@ -38,23 +36,20 @@ def train(config):
     # Setup the optimizer and the scheduler
     optimizer, scheduler = get_optimizer_and_scheduler(model, config)
 
-    global_step = 0
-    best_checkpoints = []
-    best_val_loss = float('inf')
-    epochs_no_improve = 0
+    # Load from checkpoint if provided
+    epoch, global_step, best_checkpoints, best_val_loss, epochs_no_improve = resume_training(config, model, ema_model, load_model, optimizer, scheduler)
 
     t_dist = Uniform(sde.sampling_eps, 1)
     loss_fn = get_loss_fn(config.training.loss, sde, t_dist, likelihood_weighting=config.training.likelihood_weighting)
 
-    for epoch in range(config.training.epochs):
+    for epoch in range(epoch, config.training.epochs):
         model.train()
         train_loss = 0
         for data in tqdm(train_loader, desc=f"Training Epoch {epoch + 1}/{config.training.epochs}"):
             batch = prepare_batch(data, device)
 
             optimizer.zero_grad()
-            score_fn = get_score_fn(sde, model)
-            loss = loss_fn(score_fn, batch)
+            loss = loss_fn(model, batch)
 
             loss.backward()
             if config.optim.grad_clip > 0:
@@ -76,8 +71,7 @@ def train(config):
         with torch.no_grad():
             for data in tqdm(val_loader, desc=f"Validation Epoch {epoch + 1}/{config.training.epochs}"):
                 batch = prepare_batch(data, device)
-                score_fn = get_score_fn(sde, model)
-                loss = loss_fn(score_fn, batch)
+                loss = loss_fn(model, batch)
                 val_loss += loss.item()
 
         val_loss /= len(val_loader)
@@ -118,10 +112,9 @@ def train(config):
             break
 
         if (epoch + 1) % config.training.checkpoint_frequency == 0:
-            save_model(model, ema_model, epoch, val_loss, "Model", checkpoint_dir, best_checkpoints)
+            save_model(model, ema_model, epoch, val_loss, "Model", checkpoint_dir, best_checkpoints, global_step, best_val_loss, epochs_no_improve, optimizer, scheduler)
 
     writer.close()
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Training Script for Diffusion/Score Model")

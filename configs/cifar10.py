@@ -6,7 +6,7 @@ def get_config():
 
     # Logging settings
     config.base_log_dir = "./results"
-    config.experiment = "cifar10"
+    config.experiment = "cifar10_simple_loss"
     config.tensorboard_dir = f"{config.base_log_dir}/{config.experiment}/training_logs"
     config.checkpoint_dir = f"{config.base_log_dir}/{config.experiment}/checkpoints"
     config.eval_dir = f"{config.base_log_dir}/{config.experiment}/eval"
@@ -17,21 +17,21 @@ def get_config():
     training.device = "cuda:3"
     training.gpus = 1  # Number of GPUs to use
     training.epochs = 1000
-    training.checkpoint_frequency = 20
-    training.patience_epochs = 100
+    training.checkpoint_frequency = 5
+    training.patience_epochs = 200
     ## settings for the generation callback during training
     training.vis_frequency = 5 #generate data every vis_frequency epochs
     training.fid_eval_frequency = 500 #FID evaluation frequency
-    training.steps = 128 #number of integration steps
+    training.steps = 256 #number of integration steps
     training.num_samples = 64 #number of samples to generate
     ## settings for forward SDE + loss function
     training.sde = 'vpsde'
-    training.loss = "DSM_loss"
+    training.loss = "simple_DSM_loss"
     training.likelihood_weighting = False
 
     # Data settings
     config.data = data = ml_collections.ConfigDict()
-    data.batch_size = 64
+    data.batch_size = 128
     data.dataset = 'CIFAR10'
     data.image_size = 32
     data.num_channels = 3
@@ -39,8 +39,9 @@ def get_config():
 
     # Model settings
     config.model = model = ml_collections.ConfigDict()
+    model.ema_decay = 0.9999
     model.network = 'BeatGANsUNet'
-    model.checkpoint_path = None
+    model.checkpoint = None
     model.model_channels = 128
     model.out_channels = data.num_channels
     model.num_res_blocks = 2
@@ -61,7 +62,6 @@ def get_config():
     model.resnet_cond_channels = None
     model.resnet_use_zero_module = True
     model.attn_checkpoint = False
-    model.ema_decay = 0.9999
     model.time_embed_channels = None
     model.num_input_res_blocks = None
     model.image_size = data.image_size
@@ -69,13 +69,13 @@ def get_config():
 
     # Optimization settings
     config.optim = optim = ml_collections.ConfigDict()
-    optim.weight_decay = 1e-5
-    optim.optimizer = 'Adam'
-    optim.lr = 1e-4
+    optim.weight_decay = 0.01  # Updated weight decay
+    optim.optimizer = 'AdamW'  # Use AdamW optimizer
+    optim.lr = 2e-4  # Updated learning rate
     optim.beta1 = 0.9
-    optim.beta2 = 0.999
+    optim.beta2 = 0.99  # Updated beta2
     optim.eps = 1e-8
-    optim.warmup = 1000
+    optim.warmup = 5000
     optim.grad_clip = 1.0
 
     # Evaluation settings

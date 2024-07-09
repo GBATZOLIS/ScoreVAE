@@ -25,19 +25,24 @@ def get_optimizer_and_scheduler(model, config):
         optimizer: The initialized optimizer.
         scheduler: The initialized scheduler.
     """
-    if config.optim.optimizer == 'Adam':
-        # Best default values for Adam in training diffusion models
-        # lr: 1e-4, betas: (0.9, 0.999), eps: 1e-8, weight_decay: 1e-5
+    if config.optim.optimizer == 'AdamW':
+        # Updated values for AdamW optimizer in training diffusion models
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=config.optim.get('lr', 2e-4),
+            betas=(config.optim.get('beta1', 0.9), config.optim.get('beta2', 0.99)),
+            eps=config.optim.get('eps', 1e-8),
+            weight_decay=config.optim.get('weight_decay', 0.01)  # Updated weight decay
+        )
+    elif config.optim.optimizer == 'Adam':
         optimizer = optim.Adam(
             model.parameters(),
-            lr=config.optim.get('lr', 1e-4),
-            betas=(config.optim.get('beta1', 0.9), config.optim.get('beta2', 0.999)),
+            lr=config.optim.get('lr', 2e-4),
+            betas=(config.optim.get('beta1', 0.9), config.optim.get('beta2', 0.99)),
             eps=config.optim.get('eps', 1e-8),
             weight_decay=config.optim.get('weight_decay', 1e-5)
         )
     elif config.optim.optimizer == 'RMSprop':
-        # Best default values for RMSprop in training diffusion models
-        # lr: 1e-4 to 1e-3, alpha: 0.99, eps: 1e-8, weight_decay: 1e-5
         optimizer = optim.RMSprop(
             model.parameters(),
             lr=config.optim.get('lr', 1e-4),
@@ -45,19 +50,7 @@ def get_optimizer_and_scheduler(model, config):
             eps=config.optim.get('eps', 1e-8),
             weight_decay=config.optim.get('weight_decay', 1e-5)
         )
-    elif config.optim.optimizer == 'AdamW':
-        # Best default values for AdamW in training diffusion models
-        # lr: 1e-4 to 1e-3, betas: (0.9, 0.999), eps: 1e-8, weight_decay: 1e-2 to 1e-3
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=config.optim.get('lr', 1e-4),
-            betas=(config.optim.get('beta1', 0.9), config.optim.get('beta2', 0.999)),
-            eps=config.optim.get('eps', 1e-8),
-            weight_decay=config.optim.get('weight_decay', 1e-2)
-        )
     elif config.optim.optimizer == 'SGD':
-        # Best default values for SGD with Momentum in training diffusion models
-        # lr: 1e-3 to 1e-2, momentum: 0.9, weight_decay: 1e-5
         optimizer = optim.SGD(
             model.parameters(),
             lr=config.optim.get('lr', 1e-2),
@@ -68,6 +61,6 @@ def get_optimizer_and_scheduler(model, config):
         raise ValueError(f"Optimizer {config.optim.optimizer} is not supported.")
     
     # Setup the scheduler
-    scheduler = WarmUpScheduler(optimizer, config.optim.get('lr', 1e-4), warmup_steps=config.optim.get('warmup', 5000))
+    scheduler = WarmUpScheduler(optimizer, config.optim.get('lr', 2e-4), warmup_steps=config.optim.get('warmup', 1000))
     
     return optimizer, scheduler
