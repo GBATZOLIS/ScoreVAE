@@ -36,8 +36,8 @@ def train(config):
     # Setup the optimizer and the scheduler
     optimizer, scheduler = get_optimizer_and_scheduler(model, config)
 
-    # Load from checkpoint if provided
-    epoch, global_step, best_checkpoints, best_val_loss, epochs_no_improve = resume_training(config, model, ema_model, load_model, optimizer, scheduler)
+    # Resuming: Load from checkpoint if provided and reinitialize optimizer and scheduler
+    epoch, global_step, best_checkpoints, best_val_loss, epochs_no_improve, optimizer, scheduler = resume_training(config, model, ema_model, load_model, get_optimizer_and_scheduler)
 
     t_dist = Uniform(sde.sampling_eps, 1)
     loss_fn = get_loss_fn(config.training.loss, sde, t_dist, likelihood_weighting=config.training.likelihood_weighting)

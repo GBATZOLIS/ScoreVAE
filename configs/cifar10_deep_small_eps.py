@@ -6,7 +6,7 @@ def get_config():
 
     # Logging settings
     config.base_log_dir = "./results"
-    config.experiment = "cifar10_simple_loss"
+    config.experiment = "cifar10_simple_loss_deep_small_eps"
     config.tensorboard_dir = f"{config.base_log_dir}/{config.experiment}/training_logs"
     config.checkpoint_dir = f"{config.base_log_dir}/{config.experiment}/checkpoints"
     config.eval_dir = f"{config.base_log_dir}/{config.experiment}/eval"
@@ -18,10 +18,10 @@ def get_config():
     training.gpus = 1  # Number of GPUs to use
     training.epochs = 1000
     training.checkpoint_frequency = 1
-    training.patience_epochs = 200
+    training.patience_epochs = 300
     ## settings for the generation callback during training
-    training.vis_frequency = 5 #generate data every vis_frequency epochs
-    training.fid_eval_frequency = 500 #FID evaluation frequency
+    training.vis_frequency = 50 #generate data every vis_frequency epochs
+    training.fid_eval_frequency = 2000 #FID evaluation frequency
     training.steps = 128 #number of integration steps
     training.num_samples = 128 #number of samples to generate
     ## settings for forward SDE + loss function
@@ -41,14 +41,14 @@ def get_config():
     config.model = model = ml_collections.ConfigDict()
     model.ema_decay = 0.9999
     model.network = 'BeatGANsUNet'
-    model.checkpoint = 'Model_last'
-    model.model_channels = 64
+    model.checkpoint = 'Model_epoch_646_loss_0.025'
+    model.model_channels = 128
     model.out_channels = data.num_channels
-    model.num_res_blocks = 2
+    model.num_res_blocks = 4
     model.embed_channels = 512
     model.attention_resolutions = (16,)
     model.dropout = 0.1
-    model.channel_mult = (1, 1, 2, 4)
+    model.channel_mult = (1, 2, 2, 2)
     model.input_channel_mult = None
     model.conv_resample = True
     model.dims = 2
@@ -80,7 +80,7 @@ def get_config():
 
     # Evaluation settings
     config.evaluation = evaluation = ml_collections.ConfigDict()
-    evaluation.devices = [2]
+    evaluation.devices = [0,1,2]
     evaluation.eval_callback_epochs = 20
     evaluation.num_eval_points = 10
     evaluation.eval_save_path = "./eval"

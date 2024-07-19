@@ -1,139 +1,72 @@
-import torch
-import argparse
 import os
-import glob
+import torch
+import torch.multiprocessing as mp
+from torch.utils.tensorboard import SummaryWriter
+from argparse import ArgumentParser
+import pickle
 
 from data.data_utils import get_dataloaders
-from models.mlp import MLP
-from models.unet import UNet
-from utils.sde import VESDE
-from utils.train_utils import EMA, load_model, eval_callback
-from utils.sampling_utils import get_score_fn
+from models import get_model
+from sde import configure_sde
+from utils.train_utils import prepare_training_dirs, EMA, load_model
+from utils.sampling_utils import generation_callback
+from configs import load_config
+from evaluation.fid import fid_evaluation_callback
 
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-import pickle
-import json
+def eval_fid(config):
+    _, checkpoint_dir, eval_dir = prepare_training_dirs(config)
+    writer = SummaryWriter(log_dir=eval_dir)
+    device_ids = config.evaluation.devices
 
-def visualize_data(val_loader, eval_dir):
-    points_list = []
+    train_loader, val_loader, test_loader = get_dataloaders(config.data)
 
-    # Iterate through the val_loader to collect points
-    for data in val_loader:
-        points = data[0]
-        points_list.append(points)
-        if len(torch.cat(points_list)) >= 1000:
-            break
+    model = get_model(config.model)
+    sde = configure_sde(config)
+    ema_model = EMA(model=model, decay=config.model.ema_decay)
+
+    checkpoint_path = config.model.checkpoint
+    if not os.path.isabs(checkpoint_path):
+        checkpoint_path = os.path.join(checkpoint_dir, checkpoint_path)
+    if not checkpoint_path.endswith('.pth'):
+        checkpoint_path += '.pth'
     
-    # Concatenate all collected points
-    points = torch.cat(points_list)[:1000].cpu().numpy()
-    
-    # Plot the first 1000 points
-    fig = plt.figure(figsize=(10, 10))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(points[:, 0], points[:, 1], points[:, 2])
-    
-    ax.set_xlabel('X axis')
-    ax.set_ylabel('Y axis')
-    ax.set_zlabel('Z axis')
-    ax.set_title('First 1000 Points in Validation Set')
-    
-    # Save the plot instead of showing it
-    plot_path = os.path.join(eval_dir, 'validation_data_plot.png')
-    plt.savefig(plot_path)
-    plt.close(fig)
-    print(f'Saved validation data plot to {plot_path}')
+    load_model(model, ema_model, checkpoint_path, "Model", is_ema=False)
+    ema_checkpoint_path = checkpoint_path.replace(".pth", "_EMA.pth")
+    load_model(model, ema_model, ema_checkpoint_path, "Model", is_ema=True)
 
-def evaluate(args):
-    # Set up logging directories
-    checkpoint_dir = os.path.join(args.base_log_dir, args.experiment, 'checkpoints')
-    eval_dir = os.path.join(args.base_log_dir, args.experiment, 'eval')
-    os.makedirs(eval_dir, exist_ok=True)
-
-    device = torch.device(args.device)
-
-    _, val_loader, _ = get_dataloaders(args)
-
-    # Visualize the validation dataset
-    #visualize_data(val_loader, eval_dir)
-
-    if args.network == 'MLP':
-        model = MLP(args).to(device)
-    elif args.network == 'U-NET':
-        model = UNet(args).to(device)
-
-    sde = VESDE()
-    sde.sampling_eps = 1e-5  # or use a value from args if needed
-    ema_model = EMA(model=model, decay=0.999)
-
-    # Infer the last EMA checkpoint based on the naming convention
-    last_ema_checkpoint_path = glob.glob(os.path.join(checkpoint_dir, "*_last_EMA.pth"))
-    if not last_ema_checkpoint_path:
-        raise FileNotFoundError("No checkpoint file ending with '_last_EMA.pth' found.")
-    last_ema_checkpoint_path = last_ema_checkpoint_path[0]
-
-    load_model(model, ema_model, last_ema_checkpoint_path, "Model", is_ema=True)
-
-    # Apply EMA weights to the model
     ema_model.apply_shadow()
 
-    # Set the model to evaluation mode
-    model.eval()
+    steps = config.training.steps
+    samples_per_batch = config.training.num_samples
+    shape = (samples_per_batch, *config.data.shape)
 
-    # Run evaluation callback
-    score_fn = get_score_fn(sde, model)  # Use the model with EMA weights applied
-    eval_callback(score_fn, sde, val_loader, args.num_eval_points, args.device, eval_dir)
+    # Generate the plot and save it in eval_dir
+    #practical_infer_timesteps(sde, steps)
 
-    # Evaluation and plotting
-    singular_values_files = [os.path.join(eval_dir, f) for f in os.listdir(eval_dir) if f.endswith('.pkl')]
+    # Generate samples and save to TensorBoard
+    #generation_callback(None, writer, sde, model, steps, shape, torch.device(f'cuda:{device_ids[0]}'), 0)
 
-    plt.figure(figsize=(10, 6))
-    for file in singular_values_files:
-        with open(file, 'rb') as f:
-            data = pickle.load(f)
-            singular_values = data['singular_values']
-            for sv in singular_values:
-                plt.plot(sv, alpha=0.5)
-    plt.xlabel('Index')
-    plt.ylabel('Singular Value')
-    plt.title('Spectrum of Singular Values')
-    
-    # Save the plot instead of showing it
-    spectrum_plot_path = os.path.join(eval_dir, 'singular_values_spectrum.png')
-    plt.savefig(spectrum_plot_path)
-    plt.close()
-    print(f'Saved singular values spectrum plot to {spectrum_plot_path}')
+    dataloaders = [train_loader, val_loader]
+    fid_evaluation_callback(writer, sde, model, steps, shape, device_ids, 0, dataloaders, train=True)   
+
+    dataloaders = [test_loader]
+    fid_evaluation_callback(writer, sde, model, steps, shape, device_ids, 0, dataloaders, train=False)
+
+    ema_model.restore()
+    writer.close()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluation Script for Diffusion/Score Model")
-
-    # Experiment name must be provided by the user
-    parser.add_argument("--experiment", type=str, required=True, help="Experiment name for directory structure.")
-
-    # Parse the experiment argument first
+    mp.set_start_method('spawn', force=True)  # Use 'spawn' start method
+    parser = ArgumentParser(description="FID Evaluation Script for Diffusion Model")
+    parser.add_argument("--config", type=str, required=True, help="Path to the configuration file.")
     args = parser.parse_args()
 
-    # Load arguments from the JSON file
-    args_path = os.path.join("./results", args.experiment, 'args.json')
-    if not os.path.exists(args_path):
-        raise FileNotFoundError(f"No arguments file found at {args_path}")
+    config = load_config(args.config)
 
-    with open(args_path, 'r') as f:
-        args_dict = json.load(f)
+    config_dir = os.path.join(config.base_log_dir, config.experiment)
+    os.makedirs(config_dir, exist_ok=True)
+    config_path = os.path.join(config_dir, 'config.pkl')
+    with open(config_path, 'wb') as f:
+        pickle.dump(config.to_dict(), f)
 
-    # Create a new parser to load the rest of the arguments
-    parser = argparse.ArgumentParser(description="Evaluation Script for Diffusion/Score Model")
-    
-    # Add experiment argument again to include it in the final args
-    parser.add_argument("--experiment", type=str, required=True, help="Experiment name for directory structure.")
-    
-    for key, value in args_dict.items():
-        # Skip the 'experiment' key as it's already added
-        if key == 'experiment':
-            continue
-        parser.add_argument(f"--{key}", type=type(value), default=value)
-
-    # Parse all arguments
-    args = parser.parse_args()
-
-    evaluate(args)
+    eval_fid(config)

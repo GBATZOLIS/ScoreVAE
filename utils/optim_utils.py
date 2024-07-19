@@ -1,38 +1,47 @@
 import torch.optim as optim
 
 class WarmUpScheduler:
-    def __init__(self, optimizer, target_lr, warmup_steps):
+    def __init__(self, optimizer, warmup_steps, base_lr, global_step=0):
         self.optimizer = optimizer
-        self.target_lr = target_lr
         self.warmup_steps = warmup_steps
-        self.step_num = 0
+        self.base_lr = base_lr
+        self.global_step = global_step
 
     def step(self):
-        self.step_num += 1
-        lr = self.target_lr * min(1.0, self.step_num / self.warmup_steps)
+        self.global_step += 1
+        if self.global_step < self.warmup_steps:
+            lr = self.base_lr * (self.global_step / self.warmup_steps)
+        else:
+            lr = self.base_lr
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
 
-def get_optimizer_and_scheduler(model, config):
+    def load_state_dict(self, state_dict):
+        self.__dict__.update(state_dict)
+
+    def state_dict(self):
+        return self.__dict__
+    
+def get_optimizer_and_scheduler(model, config, global_step=0):
     """
     Sets up the optimizer and scheduler based on the configuration provided.
     
     Args:
         model: The neural network model.
         config: Configuration dictionary containing optimization settings.
+        global_step: The global step counter.
     
     Returns:
         optimizer: The initialized optimizer.
         scheduler: The initialized scheduler.
     """
     if config.optim.optimizer == 'AdamW':
-        # Updated values for AdamW optimizer in training diffusion models
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config.optim.get('lr', 2e-4),
             betas=(config.optim.get('beta1', 0.9), config.optim.get('beta2', 0.99)),
             eps=config.optim.get('eps', 1e-8),
-            weight_decay=config.optim.get('weight_decay', 0.01)  # Updated weight decay
+            weight_decay=config.optim.get('weight_decay', 0.01)
         )
     elif config.optim.optimizer == 'Adam':
         optimizer = optim.Adam(
@@ -60,7 +69,7 @@ def get_optimizer_and_scheduler(model, config):
     else:
         raise ValueError(f"Optimizer {config.optim.optimizer} is not supported.")
     
-    # Setup the scheduler
-    scheduler = WarmUpScheduler(optimizer, config.optim.get('lr', 2e-4), warmup_steps=config.optim.get('warmup', 1000))
+    warmup_steps = max(0, config.optim.get('warmup', 1000) - global_step)
+    scheduler = WarmUpScheduler(optimizer, warmup_steps, config.optim.get('lr', 2e-4), global_step)
     
     return optimizer, scheduler

@@ -1,62 +1,93 @@
-from torchvision.models.inception import inception_v3
-from scipy.linalg import sqrtm
-import numpy as np
-from torch.nn.functional import adaptive_avg_pool2d
+from torchmetrics.image.fid import FrechetInceptionDistance as _FID
 from utils.train_utils import prepare_batch
 import torch
-from utils.sampling_utils import generate_specified_num_samples
+from utils.sampling_utils import generate_specified_num_samples, generate_specified_num_samples_parallel
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+import torchvision.utils as vutils
+import math
 
-def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
-    """Numpy implementation of the Frechet Distance."""
-    covmean, _ = sqrtm(sigma1.dot(sigma2), disp=False)
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-
-    mean_diff = mu1 - mu2
-    mean_diff_sq = mean_diff.dot(mean_diff)
-    trace_covmean = np.trace(covmean)
-    return mean_diff_sq + np.trace(sigma1) + np.trace(sigma2) - 2 * trace_covmean
-
-def get_activations(model, dataloaders, device):
-    model.eval()
-    activations = []
+def update_metric_with_real_activations(metric, dataloaders, device):
+    print("Updating metric with real data activations...")
+    num_real_datapoints = 0
+    first_batch_real = None
     with torch.no_grad():
         for dataloader in dataloaders:
-            for data in dataloader:
+            for data in tqdm(dataloader, desc="Processing real data"):
                 batch = prepare_batch(data, device)
                 x, _ = batch
-                pred = model(x)[0]
-                pred = adaptive_avg_pool2d(pred, (1, 1)).squeeze(3).squeeze(2)
-                activations.append(pred.cpu().numpy())
-    return np.concatenate(activations, axis=0)
+                if first_batch_real is None:
+                    first_batch_real = x
+                num_real_datapoints += x.size(0)
 
-def fid_evaluation_callback(writer, sde, model, steps, shape, device, epoch, dataloaders, train=True):
-    # Load InceptionV3 model
-    inception_model = inception_v3(pretrained=True, transform_input=False).to(device)
-    inception_model.eval()
+                # Assert that the real data is in the range [-1, 1]
+                assert torch.min(x) >= -1.0 and torch.max(x) <= 1.0, "Real data is not in the range [-1, 1]"
+                x_normalized = (x + 1) / 2  # Rescale to [0, 1]
+                metric.update(x_normalized, real=True)
+    print(f"Processed {num_real_datapoints} real data points.")
+    return num_real_datapoints, first_batch_real
 
-    # Get activations for real data (combining dataloaders)
-    real_activations = get_activations(inception_model, dataloaders, device)
+def get_generated_activations(model, sde, num_samples, steps, shape, device_ids):
+    generated_samples = generate_specified_num_samples_parallel(num_samples, sde, model, steps, shape, device_ids)
+    
+    # Clip and normalize generated samples
+    generated_samples = torch.clamp(generated_samples, -1, 1)
+    generated_samples = (generated_samples + 1) / 2  # Rescale to [0, 1]
 
-    mu_real = np.mean(real_activations, axis=0)
-    sigma_real = np.cov(real_activations, rowvar=False)
+    return generated_samples
 
-    # Generate samples
-    num_samples = len(real_activations)
+def update_metric_with_fake_activations(metric, generated_samples, dataloaders, device):
+    print("Updating metric with fake data activations...")
+    generated_dataset = TensorDataset(generated_samples)
+    batch_size = dataloaders[0].batch_size  # Assuming all dataloaders have the same batch size
+    generated_dataloader = DataLoader(generated_dataset, batch_size=batch_size, shuffle=False)
+
+    first_batch_fake = None
+    with torch.no_grad():
+        for i, batch in enumerate(tqdm(generated_dataloader, desc="Processing generated data")):
+            batch = batch[0].to(device)  # Move to device and unpack the tensor from the list
+            if i == 0:
+                first_batch_fake = batch
+            metric.update(batch, real=False)
+    print("Updated metric with generated data activations.")
+    return first_batch_fake
+
+def fid_evaluation_callback(writer, sde, model, steps, shape, device_ids, epoch, dataloaders, train=True):
+    primary_device = torch.device(f'cuda:{device_ids[0]}')
+    
+    # If argument normalize is True images are expected to be dtype float and have values in the [0,1] range
+    fid = _FID(normalize=True).to(primary_device)
+
+    # Get activations for real data
+    num_real_datapoints, first_batch_real = update_metric_with_real_activations(fid, dataloaders, primary_device)
+
+    # Generate samples and get activations for generated data
+    num_samples = num_real_datapoints
     print(f'Generating {num_samples} samples for FID evaluation.')
-    generated_samples = generate_specified_num_samples(num_samples, sde, model, steps, shape, device)
-
-    # Convert generated samples to tensor and move to device for activations calculation
-    generated_samples = torch.tensor(generated_samples).to(device)
-    generated_activations = get_activations(inception_model, [generated_samples], device)
-
-    mu_generated = np.mean(generated_activations, axis=0)
-    sigma_generated = np.cov(generated_activations, rowvar=False)
+    generated_samples = get_generated_activations(model, sde, num_samples, steps, shape, device_ids)
+    
+    # Update metric with fake activations
+    first_batch_fake = update_metric_with_fake_activations(fid, generated_samples, dataloaders, primary_device)
 
     # Calculate FID
-    fid_score = calculate_frechet_distance(mu_real, sigma_real, mu_generated, sigma_generated)
+    fid_score = fid.compute().item()
 
     # Log FID score
     dataset = 'Train' if train else 'Test'
     writer.add_scalar(f'FID/{dataset}', fid_score, epoch)
     print(f'Epoch {epoch + 1}: {dataset} FID: {fid_score:.4f}')
+    
+    
+    # Plot the first batch of real data
+    if first_batch_real is not None:
+        num_rows = int(math.sqrt(first_batch_real.size(0)))
+        real_grid = vutils.make_grid(first_batch_real, nrow=num_rows, normalize=True, scale_each=True)
+        writer.add_image(f'Real Images/{dataset}', real_grid, epoch)
+
+    # Plot the first batch of generated data
+    if first_batch_fake is not None:
+        num_rows = int(math.sqrt(first_batch_fake.size(0)))
+        fake_grid = vutils.make_grid(first_batch_fake, nrow=num_rows, normalize=True, scale_each=True)
+        writer.add_image(f'Generated Images/{dataset}', fake_grid, epoch)
+    

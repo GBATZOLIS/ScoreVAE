@@ -67,10 +67,11 @@ class EMA:
                 param.data = self.backup[name]
         self.backup = {}
 
+
 def save_model(model, ema_model, epoch, loss, model_name, checkpoint_dir, best_checkpoints, global_step, best_val_loss, epochs_no_improve, optimizer, scheduler):
     def write_model(model, path, epoch, loss, is_ema=False):
         state_dict = model.state_dict() if not is_ema else ema_model.shadow
-        torch.save({
+        checkpoint = {
             'epoch': epoch,
             'model_state_dict': state_dict,
             'loss': loss,
@@ -78,9 +79,11 @@ def save_model(model, ema_model, epoch, loss, model_name, checkpoint_dir, best_c
             'best_checkpoints': best_checkpoints,
             'best_val_loss': best_val_loss,
             'epochs_no_improve': epochs_no_improve,
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict()
-        }, path)
+            'optimizer_state_dict': optimizer.state_dict()
+        }
+        if hasattr(scheduler, 'state_dict'):
+            checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+        torch.save(checkpoint, path)
     
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
@@ -101,8 +104,10 @@ def save_model(model, ema_model, epoch, loss, model_name, checkpoint_dir, best_c
         worst_checkpoint = max(best_checkpoints, key=lambda x: x[2])
         if loss < worst_checkpoint[2]:
             best_checkpoints.remove(worst_checkpoint)
-            os.remove(worst_checkpoint[0])
-            os.remove(worst_checkpoint[1])
+            if os.path.exists(worst_checkpoint[0]):
+                os.remove(worst_checkpoint[0])
+            if os.path.exists(worst_checkpoint[1]):
+                os.remove(worst_checkpoint[1])
 
             new_checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}_epoch_{epoch}_loss_{loss:.3f}.pth")
             new_ema_checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}_epoch_{epoch}_loss_{loss:.3f}_EMA.pth")
@@ -133,15 +138,18 @@ def load_model(model, ema_model, checkpoint_path, model_name, optimizer=None, sc
     if optimizer and 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     if scheduler and 'scheduler_state_dict' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if hasattr(scheduler, 'load_state_dict'):
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     
     print(f"{model_name} {'EMA' if is_ema else ''} model loaded from '{checkpoint_path}', Epoch: {epoch}, Loss: {loss}")
     
     return epoch, loss, global_step, best_checkpoints, best_val_loss, epochs_no_improve
 
 
-def resume_training(config, model, ema_model, load_model_func, optimizer, scheduler):
-    if config.model.checkpoint:
+
+def resume_training(config, model, ema_model, load_model_func, get_optimizer_and_scheduler_func):
+    optimizer, scheduler = get_optimizer_and_scheduler_func(model, config)
+    if hasattr(config.model, 'checkpoint') and config.model.checkpoint:
         checkpoint_path = config.model.checkpoint
         if not os.path.isabs(checkpoint_path):
             checkpoint_path = os.path.join(config.checkpoint_dir, checkpoint_path)
@@ -155,9 +163,14 @@ def resume_training(config, model, ema_model, load_model_func, optimizer, schedu
         _, _, _, _, _, _ = load_model_func(model, ema_model, ema_checkpoint_path, "Model", is_ema=True)
         
         print(f"Resuming training from epoch {epoch + 1}")
-        return epoch + 1, global_step, best_checkpoints, best_val_loss, epochs_no_improve
+        
+        # Reinitialize optimizer and scheduler with the correct global_step
+        optimizer, scheduler = get_optimizer_and_scheduler_func(model, config, global_step)
+        
+        return epoch + 1, global_step, best_checkpoints, best_val_loss, epochs_no_improve, optimizer, scheduler
     else:
-        return 0, 0, [], float('inf'), 0
+        optimizer, scheduler = get_optimizer_and_scheduler_func(model, config)
+        return 0, 0, [], float('inf'), 0, optimizer, scheduler
     
 
 def get_score_fn(sde, diffusion_model):

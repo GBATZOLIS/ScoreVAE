@@ -5,20 +5,16 @@ import torch
 import numpy as np
 
 def configure_sde(config):
-    sampling_eps = 1e-3  # Default sampling epsilon
+    sampling_eps = 1e-5  # Default sampling epsilon
     sde = None
 
     if config.training.sde.lower() == 'vpsde':
         sde = VPSDE(beta_min=0.1, beta_max=20., N=1000)
-        sampling_eps = 1e-3
     elif config.training.sde.lower() == 'subvpsde':
         sde = subVPSDE(beta_min=0.1, beta_max=20., N=1000)
-        sampling_eps = 1e-3
     elif config.training.sde.lower() == 'vesde':
         sde = VESDE(sigma_min=0.01, sigma_max=50, N=1000)
-        sampling_eps = 1e-5
     elif config.training.sde.lower() == 'snrsde':
-        sampling_eps = 1e-3
 
         if hasattr(config.training, 'beta_schedule'):
             # DISCRETE QUANTITIES

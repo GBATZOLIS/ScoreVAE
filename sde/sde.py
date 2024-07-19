@@ -186,6 +186,12 @@ class VPSDE(SDE):
   def T(self):
     return 1
 
+  def edm_coefficients(self, t):
+     beta_d = self.beta_1 - self.beta_0
+     edm_s_t = torch.exp(-0.25 * beta_d * t ** 2 - 0.5 * t * self.beta_0)
+     edm_sigma_t = torch.sqrt(torch.exp(0.5 * beta_d * t ** 2 + self.beta_0 * t) - 1)
+     return edm_s_t, edm_sigma_t
+
   def perturbation_coefficients(self, t):
     log_mean_coeff = -0.25 * t ** 2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
     a_t = torch.exp(log_mean_coeff)
