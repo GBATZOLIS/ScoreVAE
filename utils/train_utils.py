@@ -32,9 +32,15 @@ def prepare_batch(data, device):
     else:
         raise ValueError("Unsupported data type.")
 
-def print_model_size(model):
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'Total number of parameters: {total_params}')
+def print_model_summary(model):
+    total_trainable_params = 0
+
+    for module in model.modules():
+        num_trainable_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        total_trainable_params += num_trainable_params
+
+    print(f'Total number of trainable parameters: {total_trainable_params}')
+
 
 class EMA:
     def __init__(self, model, decay):
@@ -173,14 +179,11 @@ def resume_training(config, model, ema_model, load_model_func, get_optimizer_and
         return 0, 0, [], float('inf'), 0, optimizer, scheduler
     
 
-def get_score_fn(sde, diffusion_model):
-    def score_fn(x, y, t):
-        noise_prediction = diffusion_model(x, y, t)
-        _, std = sde.marginal_prob(x, t)
-        std = std.view(std.shape[0], *[1 for _ in range(len(x.shape) - 1)])  # Expand std to match the shape of noise_prediction
-        score = -noise_prediction / std
-        return score
-    return score_fn
+def get_noise_fn(sde, diffusion_model, train=True):
+    return diffusion_model.get_noise_predictor_fn(sde, train)
+
+def get_score_fn(sde, diffusion_model, train=True):
+    return diffusion_model.get_score_fn(sde, train)
 
 def eval_callback(score_fn, sde, val_dataloader, num_datapoints, device, save_path, name=None, return_svd=False):
     os.makedirs(save_path, exist_ok=True)

@@ -10,8 +10,8 @@ import pickle
 from data.data_utils import get_dataloaders
 from models import get_model
 from sde import configure_sde
-from utils.train_utils import prepare_training_dirs, prepare_batch, print_model_size, EMA, save_model, load_model, get_score_fn, eval_callback, resume_training
-from utils.sampling_utils import generation_callback
+from utils.train_utils import prepare_training_dirs, prepare_batch, print_model_summary, EMA, save_model, load_model, resume_training
+from utils.sampling_utils import get_generation_callback
 from utils.optim_utils import get_optimizer_and_scheduler
 from torch.distributions import Uniform
 from loss import get_loss_fn
@@ -28,7 +28,7 @@ def train(config):
     # Create the model
     model = get_model(config.model)
     model = model.to(device)
-    print_model_size(model)
+    model.print_model_summary()
 
     sde = configure_sde(config)
     ema_model = EMA(model=model, decay=config.model.ema_decay)
@@ -40,7 +40,8 @@ def train(config):
     epoch, global_step, best_checkpoints, best_val_loss, epochs_no_improve, optimizer, scheduler = resume_training(config, model, ema_model, load_model, get_optimizer_and_scheduler)
 
     t_dist = Uniform(sde.sampling_eps, 1)
-    loss_fn = get_loss_fn(config.training.loss, sde, t_dist, likelihood_weighting=config.training.likelihood_weighting)
+    loss_fn = get_loss_fn(config, sde, t_dist)
+    generation_callback = get_generation_callback(config.training.vis_callback)
 
     for epoch in range(epoch, config.training.epochs):
         model.train()
@@ -49,7 +50,7 @@ def train(config):
             batch = prepare_batch(data, device)
 
             optimizer.zero_grad()
-            loss = loss_fn(model, batch)
+            loss = loss_fn(model, batch, train=True)
 
             loss.backward()
             if config.optim.grad_clip > 0:
@@ -71,7 +72,7 @@ def train(config):
         with torch.no_grad():
             for data in tqdm(val_loader, desc=f"Validation Epoch {epoch + 1}/{config.training.epochs}"):
                 batch = prepare_batch(data, device)
-                loss = loss_fn(model, batch)
+                loss = loss_fn(model, batch, train=False)
                 val_loss += loss.item()
 
         val_loss /= len(val_loader)
@@ -84,9 +85,7 @@ def train(config):
 
             data = next(iter(val_loader))
             batch = prepare_batch(data, device)
-            _, y = batch
-
-            generation_callback(y, writer, sde, model, steps, shape, device, epoch)
+            generation_callback(batch, writer, sde, model, steps, shape, device, epoch)
 
         if (epoch + 1) % config.training.fid_eval_frequency == 0:
             steps = config.training.steps

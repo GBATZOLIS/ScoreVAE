@@ -202,4 +202,36 @@ class BeatGANsUNet(nn.Module):
 
         pred = self.out(h)
         return pred
+    
+    def get_score_fn(self, sde, train):
+        """
+        Returns a function that computes the score.
+        
+        Args:
+            sde: The SDE object that provides the marginal probability.
+            train: Boolean flag indicating whether in training mode.
+            
+        Returns:
+            score_fn: A function that computes the score based on the diffusion model's noise prediction.
+        """
+        def score_fn(x, y, t):
+            noise_prediction = self.forward(x, y, t)
+            _, std = sde.marginal_prob(x, t)
+            std = std.view(std.shape[0], *[1 for _ in range(len(x.shape) - 1)])  # Expand std to match the shape of noise_prediction
+            score = -noise_prediction / std
+            return score
+        
+        return score_fn
+
+    def print_model_summary(self):
+        """
+        Prints the number of trainable and non-trainable parameters in the diffusion model.
+        """
+        total_params = sum(p.numel() for p in self.parameters())
+        total_trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total_non_trainable_params = total_params - total_trainable_params
+
+        print(f"Total number of parameters: {total_params}")
+        print(f"Total number of trainable parameters: {total_trainable_params}")
+        print(f"Total number of non-trainable parameters: {total_non_trainable_params}")
 

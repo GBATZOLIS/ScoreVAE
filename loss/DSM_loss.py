@@ -1,7 +1,8 @@
 import torch
 from utils.train_utils import get_score_fn
 
-def get_loss_fn(sde, t_dist, likelihood_weighting=False):
+def get_loss_fn(config, sde, t_dist):
+    likelihood_weighting = config.training.likelihood_weighting
     def loss_fn(model, batch):
         score_fn = get_score_fn(sde, model)
         x, y = batch

@@ -16,14 +16,8 @@ import os
 import matplotlib
 matplotlib.use('Agg')
 
-def get_score_fn(sde, diffusion_model):
-    def score_fn(x, y, t):
-        noise_prediction = diffusion_model(x, y, t)
-        _, std = sde.marginal_prob(x, t)
-        std = std.view(std.shape[0], *[1 for _ in range(len(x.shape) - 1)])  # Expand std to match the shape of noise_prediction
-        score = -noise_prediction / std
-        return score
-    return score_fn
+def get_score_fn(sde, diffusion_model, train=False):
+    return diffusion_model.get_score_fn(sde, train)
 
 def get_inverse_step_fn(discretisation):
     # Discretisation sequence is ordered from biggest time to smallest time
@@ -150,7 +144,7 @@ def evaluation_mode(model):
 def generate_samples(y, sde, diffusion_model, steps, shape, device):
     diffusion_model.to(device)  # Ensure the model is on the correct device
     with evaluation_mode(diffusion_model):
-        score_fn = get_score_fn(sde, diffusion_model)
+        score_fn = get_score_fn(sde, diffusion_model, train=False)
         with torch.no_grad():
             x_mean = Algorithm1(sde, steps, score_fn, shape, device, y)
 
@@ -211,34 +205,60 @@ def plot_and_save_histogram_of_norms(samples, writer, steps):
     # Save the histogram plot to TensorBoard
     save_plot_to_tensorboard(writer, fig, 'Histogram of Norms', steps)
 
-def generation_callback(y, writer, sde, diffusion_model, steps, shape, device, epoch):
-    #y is the condition. 
-    samples = generate_samples(y, sde, diffusion_model, steps, shape, device)
-    
-    if len(samples.shape[1:]) == 1: #euclidean data, i.e. shape=(batchsize, ambient_dim)
-        if samples.shape[1] in [2, 3]:
-            # Plot the samples
-            fig, ax = plot_samples(samples)
+def get_generation_callback(vis_callback):
+    if vis_callback == 'base':
+        def generation_callback(batch, writer, sde, diffusion_model, steps, shape, device, epoch):
+            #Unconditional diffusion models
+            _, y = batch
+            #y is the condition. 
+            samples = generate_samples(y, sde, diffusion_model, steps, shape, device)
             
-            # Save the plot to TensorBoard with epoch number in the tag
-            save_plot_to_tensorboard(writer, fig, f'Generated Samples/Epoch {epoch + 1}', epoch)
+            if len(samples.shape[1:]) == 1: #euclidean data, i.e. shape=(batchsize, ambient_dim)
+                if samples.shape[1] in [2, 3]:
+                    # Plot the samples
+                    fig, ax = plot_samples(samples)
+                    
+                    # Save the plot to TensorBoard with epoch number in the tag
+                    save_plot_to_tensorboard(writer, fig, f'Generated Samples/Epoch {epoch + 1}', epoch)
+                
+                
+                # Plot and save the histogram of norms
+                plot_and_save_histogram_of_norms(samples, writer, epoch)
+            elif len(samples.shape[1:]) == 3: #assume images of shape (channels, width, height)
+                # samples is a batch of images of shape (batchsize, c, w, h)
+                num_rows = int(math.sqrt(samples.shape[0]))
+                
+                # Create a grid of images
+                grid = vutils.make_grid(samples, nrow=num_rows, normalize=True, scale_each=True)
+                
+                # Save the image grid to TensorBoard
+                writer.add_image(f'Generated Images', grid, epoch)
+    
+    elif vis_callback == 'scoreVAE':
+        def generation_callback(batch, writer, sde, diffusion_model, steps, shape, device, epoch):
+            x, y = batch
+            z = diffusion_model.encode(x)  # Get the latent representation
+            cond = [y, z]
+            reconstruction = generate_samples(cond, sde, diffusion_model, steps, shape, device)
+            
+            # Visualize reconstructions
+            num_rows = int(math.sqrt(reconstruction.shape[0]))
+            grid_reconstruction = vutils.make_grid(reconstruction, nrow=num_rows, normalize=True, scale_each=True)
+            writer.add_image(f'Reconstruction', grid_reconstruction, epoch)
+            
+            # Visualize original images
+            grid_original = vutils.make_grid(x, nrow=num_rows, normalize=True, scale_each=True)
+            writer.add_image(f'Original', grid_original, epoch)
+    
+    return generation_callback
+
         
-        
-        # Plot and save the histogram of norms
-        plot_and_save_histogram_of_norms(samples, writer, epoch)
-    elif len(samples.shape[1:]) == 3: #assume images of shape (channels, width, height)
-        # samples is a batch of images of shape (batchsize, c, w, h)
-        num_rows = int(math.sqrt(samples.shape[0]))
-        
-        # Create a grid of images
-        grid = vutils.make_grid(samples, nrow=num_rows, normalize=True, scale_each=True)
-        
-        # Save the image grid to TensorBoard
-        writer.add_image(f'Generated Images', grid, epoch)
+    return generation_callback
+
 
 def generate_specified_num_samples(num_samples, sde, diffusion_model, steps, shape, device):
     with evaluation_mode(diffusion_model):
-        score_fn = get_score_fn(sde, diffusion_model)
+        score_fn = get_score_fn(sde, diffusion_model, train=False)
         with torch.no_grad():
             all_samples = []
             num_iterations = (num_samples + shape[0] - 1) // shape[0]  # Calculate the number of iterations required
@@ -256,7 +276,7 @@ def generate_samples_on_device(device_id, num_samples_per_device, sde, diffusion
     diffusion_model.to(device)
     
     with evaluation_mode(diffusion_model):
-        score_fn = get_score_fn(sde, diffusion_model)
+        score_fn = get_score_fn(sde, diffusion_model, train=False)
 
         with torch.no_grad():  # Ensure no_grad is used to prevent memory leaks
             all_samples = []
