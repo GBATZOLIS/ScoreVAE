@@ -7,7 +7,7 @@ from tqdm import tqdm
 import argparse
 import pickle
 
-from data.data_utils import get_dataloaders
+from data import get_dataloaders
 from models import get_model
 from sde import configure_sde
 from utils.train_utils import prepare_training_dirs, prepare_batch, print_model_size, EMA, save_model, load_model, get_score_fn, eval_callback, resume_training

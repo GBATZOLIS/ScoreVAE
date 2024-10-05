@@ -3,6 +3,7 @@ import torch
 import pandas as pd
 import numpy as np
 from torch.utils.data import Dataset
+from .utils import flatten_structure, unflatten_structure
 
 class CATHPreprocessedDataset(Dataset):
     def __init__(self, data_path):
@@ -12,7 +13,20 @@ class CATHPreprocessedDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        item = self.data[idx]
+
+        # Ensure that each tensor in the item is of type float32
+        if isinstance(item, torch.Tensor):
+            return item.float()
+        elif isinstance(item, dict):
+            # If the item is a dictionary, convert all tensors in the dict
+            return {key: value.float() if isinstance(value, torch.Tensor) else value for key, value in item.items()}
+        elif isinstance(item, list):
+            # If the item is a list, convert all tensors in the list
+            return [element.float() if isinstance(element, torch.Tensor) else element for element in item]
+        else:
+            return item
+
     
 class CATHOriginalDataset(Dataset):
     ATOM_TYPES = [
@@ -36,7 +50,13 @@ class CATHOriginalDataset(Dataset):
         self.make_fixed_size(np_example)
         self.center_positions(np_example)
         backbone_positions, backbone_mask = self.extract_backbone(np_example)
-        return backbone_positions
+        
+        # Divide the backbone positions by 100
+        backbone_positions /= 100.0
+        
+        item = flatten_structure(torch.tensor(backbone_positions, dtype=torch.float32))
+        return item
+        
         #return {
         #    'backbone_positions': torch.tensor(backbone_positions, dtype=torch.float32),
         #    'backbone_mask': torch.tensor(backbone_mask, dtype=torch.float32)

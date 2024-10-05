@@ -11,10 +11,56 @@ from torch.nn import DataParallel
 import torch.multiprocessing as mp
 import ctypes  # Add this line
 import os 
+import io
+from PIL import Image
 
 # Set the Matplotlib backend to Agg
 import matplotlib
 matplotlib.use('Agg')
+
+def unflatten_structure(flattened_structure, num_atoms=4):
+    """
+    Reshapes the structure back from (num_residues*num_atoms, 3) to (num_residues, num_atoms, 3).
+    """
+    total_atoms = flattened_structure.shape[0]
+    assert total_atoms % num_atoms == 0, "The total number of atoms should be divisible by num_atoms."
+    
+    num_residues = total_atoms // num_atoms
+    unflattened_structure = flattened_structure.reshape(num_residues, num_atoms, 3)
+    return unflattened_structure
+
+def plot_to_tensorboard(writer, fig, tag, epoch, angle_idx):
+    """
+    Convert a matplotlib figure to a NumPy array and write it to TensorBoard.
+    """
+    # Save the plot to a bytes buffer in memory
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png')
+    buf.seek(0)
+    
+    # Convert the bytes buffer to a PIL image
+    img = Image.open(buf)
+    img = np.array(img)
+
+    # Add the image to TensorBoard
+    writer.add_image(f'{tag}_angle_{angle_idx}', img.transpose(2, 0, 1), epoch)  # Transpose to (C, H, W)
+
+def save_protein_plot_to_tensorboard(atom_positions, backbone_mask, angles, writer, tag, epoch):
+    fig = plt.figure(figsize=(12, 12))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot backbone atom positions (blue points)
+    for i in range(atom_positions.shape[0]):
+        for j in range(atom_positions.shape[1]):
+            if backbone_mask[i, j] > 0:
+                ax.scatter(atom_positions[i, j, 0], atom_positions[i, j, 1], atom_positions[i, j, 2], c='b')
+
+    # Save the plot from different angles
+    for i, angle in enumerate(angles):
+        ax.view_init(elev=angle[0], azim=angle[1])
+        plot_to_tensorboard(writer, fig, tag, epoch, i)
+
+    plt.close(fig)
 
 def get_score_fn(sde, diffusion_model):
     def score_fn(x, y, t):
@@ -235,6 +281,24 @@ def generation_callback(y, writer, sde, diffusion_model, steps, shape, device, e
         
         # Save the image grid to TensorBoard
         writer.add_image(f'Generated Images', grid, epoch)
+    elif len(samples.shape[1:]) == 2: #assumes proteins of shape (batchsize, num_aminoacids*num_atoms, 3)
+        num_aminoacids = 256  # Adjust based on config.data.max_seq_length
+        num_atoms = 4  # Adjust based on config.data.num_backbone_atoms
+
+        # Reshape the protein batch (batchsize, num_aminoacids * num_atoms, 3) to (batchsize, num_aminoacids, num_atoms, 3)
+        samples_reshaped = samples.view(samples.shape[0], num_aminoacids, num_atoms, 3).detach().cpu().numpy()
+
+        # Define the angles for the 2D projections
+        angles = [(30, 30), (90, 0), (0, 90), (60, 60)]
+
+        # Visualize the first four proteins from four different angles
+        for i in range(4):
+            atom_positions = samples_reshaped[i]  # First protein in batch
+            # Generate a mask (since we don't have an explicit one, assume all atoms are valid)
+            backbone_mask = np.ones((num_aminoacids, num_atoms))
+
+            # Save the protein from multiple angles to TensorBoard
+            save_protein_plot_to_tensorboard(atom_positions, backbone_mask, angles, writer, f"protein_{i}", epoch)
 
 def generate_specified_num_samples(num_samples, sde, diffusion_model, steps, shape, device):
     with evaluation_mode(diffusion_model):

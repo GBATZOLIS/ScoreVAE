@@ -5,15 +5,17 @@ from torch.utils.tensorboard import SummaryWriter
 from argparse import ArgumentParser
 import pickle
 
-from data.data_utils import get_dataloaders
+from data import get_dataloaders
 from models import get_model
 from sde import configure_sde
 from utils.train_utils import prepare_training_dirs, EMA, load_model
 from utils.sampling_utils import generation_callback
 from configs import load_config
-from evaluation.fid import fid_evaluation_callback
+from evaluation.ramachandran import generate_ramachandran_plots
+from evaluation.visualise import visualise_and_save_proteins
+from utils.sampling_utils import generate_specified_num_samples_parallel
 
-def eval_fid(config):
+def eval(config):
     _, checkpoint_dir, eval_dir = prepare_training_dirs(config)
     writer = SummaryWriter(log_dir=eval_dir)
     device_ids = config.evaluation.devices
@@ -40,19 +42,16 @@ def eval_fid(config):
     samples_per_batch = config.training.num_samples
     shape = (samples_per_batch, *config.data.shape)
 
-    # Generate the plot and save it in eval_dir
-    #practical_infer_timesteps(sde, steps)
+    generated_samples = generate_specified_num_samples_parallel(10, sde, model, steps, shape, device_ids)
+    print(generated_samples.size())
+    visualise_and_save_proteins(generated_samples, config.eval_dir)
 
-    # Generate samples and save to TensorBoard
-    #generation_callback(None, writer, sde, model, steps, shape, torch.device(f'cuda:{device_ids[0]}'), 0)
-
-    dataloaders = [train_loader, val_loader]
-    fid_evaluation_callback(writer, sde, model, steps, shape, device_ids, 0, dataloaders, train=True)   
-
-    dataloaders = [test_loader]
-    fid_evaluation_callback(writer, sde, model, steps, shape, device_ids, 0, dataloaders, train=False)
+    dataloaders = [train_loader]
+    num_samples = config.evaluation.num_samples
+    generate_ramachandran_plots(model, sde, num_samples, steps, shape, device_ids, dataloaders)
 
     ema_model.restore()
+
     writer.close()
 
 if __name__ == "__main__":
@@ -69,4 +68,4 @@ if __name__ == "__main__":
     with open(config_path, 'wb') as f:
         pickle.dump(config.to_dict(), f)
 
-    eval_fid(config)
+    eval(config)

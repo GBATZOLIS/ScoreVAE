@@ -6,7 +6,7 @@ def get_config():
 
     # Logging settings
     config.base_log_dir = "./results"
-    config.experiment = "cath"
+    config.experiment = "cath_fixed_scaling_deeper"
     config.tensorboard_dir = f"{config.base_log_dir}/{config.experiment}/training_logs"
     config.checkpoint_dir = f"{config.base_log_dir}/{config.experiment}/checkpoints"
     config.eval_dir = f"{config.base_log_dir}/{config.experiment}/eval"
@@ -14,7 +14,7 @@ def get_config():
     # Training settings
     config.training = training = ml_collections.ConfigDict()
     ## general training settings
-    training.device = "cuda:2"
+    training.device = "cuda:1"
     training.gpus = 1  # Number of GPUs to use
     training.epochs = 1000
     training.checkpoint_frequency = 1
@@ -35,7 +35,7 @@ def get_config():
     # Batch size
     data.batch_size = 64  # Adjusted based on typical sizes for 3D geometric data
     # Dataset name
-    data.dataset = 'cath-original'
+    data.dataset = 'cath-preprocessed'
     # Sequence length (number of residues)
     data.max_seq_length = 256  # Max sequence length for each protein structure
     # Number of backbone atoms (N, CA, C, O)
@@ -47,16 +47,16 @@ def get_config():
 
     # Model settings
     config.model = model = ml_collections.ConfigDict()
-    model.ema_decay = 0.9999  # Exponential moving average (EMA) decay
+    model.ema_decay = 0.9995  # Exponential moving average (EMA) decay
 
     # Updated model parameters
     model.network = 'SE3DiffusionTransformer'  # Updated to match the class name in the transformer code
-    model.checkpoint = '/home/gb511/latent/results/cath/checkpoints/Model_last.pth'  # Checkpoint to load, if available
+    model.checkpoint = None  # Checkpoint to load, if available
     model.num_channels = data.num_coordinates
     model.time_embedding_dim = 64  # Time embedding dimension for diffusion process
     model.time_embedding_channels = 1
-    model.num_layers = 3  # Number of transformer layers
-    model.num_heads = 4  # Number of attention heads in each transformer layer
+    model.num_layers = 4  # Number of transformer layers
+    model.num_heads =  4 # Number of attention heads in each transformer layer
     model.dim_head = 16  # Dimension of each attention head
     model.num_degrees = 2  # Number of degrees (0, 1, 2)
 
