@@ -43,12 +43,11 @@ def eval(config):
     shape = (samples_per_batch, *config.data.shape)
 
     generated_samples = generate_specified_num_samples_parallel(10, sde, model, steps, shape, device_ids)
-    print(generated_samples.size())
     visualise_and_save_proteins(generated_samples, config.eval_dir)
 
     dataloaders = [train_loader]
     num_samples = config.evaluation.num_samples
-    generate_ramachandran_plots(model, sde, num_samples, steps, shape, device_ids, dataloaders)
+    generate_ramachandran_plots(model, sde, num_samples, steps, shape, device_ids, dataloaders, config.eval_dir)
 
     ema_model.restore()
 

@@ -146,7 +146,7 @@ def visualise_protein(protein):
     
     return fig
 
-def visualise_raw_protein(protein):
+def visualise_raw_protein(protein_flattened):
     """
     Visualizes the 3D structure of a raw unflattened protein structure as connected points.
     This function connects points linearly from index 0 to the last point.
@@ -156,7 +156,7 @@ def visualise_raw_protein(protein):
                containing the 3D coordinates of the backbone atoms.
     """
     # Flatten the protein into a continuous list of 3D points
-    protein_flattened = protein.reshape(-1, 3)  # Shape: (num_residues*num_atoms, 3)
+    #protein_flattened = protein.reshape(-1, 3)  # Shape: (num_residues*num_atoms, 3)
     
     # Create a 3D scatter plot with connected lines
     fig = go.Figure(go.Scatter3d(
@@ -164,7 +164,7 @@ def visualise_raw_protein(protein):
         y=protein_flattened[:, 1],  # Y coordinates
         z=protein_flattened[:, 2],  # Z coordinates
         mode='lines+markers',  # Connect points with lines and show markers
-        line=dict(color='blue', width=2),  # Blue lines
+        line=dict(color='red', width=2),  # Blue lines
         marker=dict(size=5, color='blue')  # Blue markers
     ))
     
@@ -209,7 +209,7 @@ def visualise_and_save_proteins(samples, eval_dir):
         #assert protein.shape == (protein.shape[0], 4, 3), f"Sample {idx} has an incorrect shape."
         
         # Generate the interactive 3D plot using the visualise_protein function
-        fig = simply_visualise_protein(protein)
+        fig = visualise_protein(protein)
         
         # Save the plot as an HTML file with the sample index
         html_filename = os.path.join(save_dir, f'protein_sample_{idx + 1}.html')

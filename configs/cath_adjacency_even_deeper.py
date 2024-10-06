@@ -14,7 +14,7 @@ def get_config():
     # Training settings
     config.training = training = ml_collections.ConfigDict()
     ## general training settings
-    training.device = "cuda:3"
+    training.device = "cuda:1"
     training.gpus = 1  # Number of GPUs to use
     training.epochs = 1000
     training.checkpoint_frequency = 1
@@ -22,8 +22,8 @@ def get_config():
     ## settings for the generation callback during training
     training.vis_frequency = 20  # Generate data every vis_frequency epochs
     training.fid_eval_frequency = 2000  # FID evaluation frequency
-    training.steps = 128  # Number of integration steps
-    training.num_samples = 32  # Number of samples to generate
+    training.steps = 256  # Number of integration steps
+    training.num_samples = 64  # Number of samples to generate
     ## settings for forward SDE + loss function
     training.sde = 'vpsde'
     training.loss = "simple_DSM_loss"  # Denoising score matching loss. Simple weighting used
@@ -51,7 +51,7 @@ def get_config():
 
     # Updated model parameters
     model.network = 'SE3TransformerWadjacency'  # Updated to match the class name in the transformer code
-    model.checkpoint = None  # Checkpoint to load, if available
+    model.checkpoint = '/home/gb511/latent/results/adjacency_correct_selfattention_even_deeper/checkpoints/Model_epoch_483_loss_0.021.pth'  # Checkpoint to load, if available
     model.num_channels = data.num_coordinates
     model.time_embedding_dim = 64  # Time embedding dimension for diffusion process
     model.time_embedding_channels = 1
@@ -77,8 +77,8 @@ def get_config():
 
     # Evaluation settings
     config.evaluation = evaluation = ml_collections.ConfigDict()
-    evaluation.num_samples = 1000
-    evaluation.devices = [2]
+    evaluation.num_samples = 64
+    evaluation.devices = [1]
     evaluation.eval_callback_epochs = 20
     evaluation.num_eval_points = 10
     evaluation.eval_save_path = "./eval"
