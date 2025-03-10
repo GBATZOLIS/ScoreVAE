@@ -127,7 +127,7 @@ def save_model(model, ema_model, epoch, loss, model_name, checkpoint_dir, best_c
 
 
 def load_model(model, ema_model, checkpoint_path, model_name, optimizer=None, scheduler=None, is_ema=False):
-    checkpoint = torch.load(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
     if is_ema:
         for name, data in checkpoint['model_state_dict'].items():
             ema_model.shadow[name].copy_(data)

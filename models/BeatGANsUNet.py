@@ -179,6 +179,7 @@ class BeatGANsUNet(nn.Module):
     def forward(self, x, y, t):
         hs = [[] for _ in range(len(self.conf.channel_mult))]
         emb = self.time_embed(timestep_embedding(t, self.time_emb_channels))
+        
 
         h = x  # No need to change type here
         k = 0
@@ -203,7 +204,7 @@ class BeatGANsUNet(nn.Module):
         pred = self.out(h)
         return pred
     
-    def get_score_fn(self, sde, train):
+    def get_score_fn(self, sde):
         """
         Returns a function that computes the score.
         
@@ -222,6 +223,17 @@ class BeatGANsUNet(nn.Module):
             return score
         
         return score_fn
+    
+    def get_denoiser_fn(self, sde):
+        # Infer the alpha and sigma functions from the SDE
+        alpha_fn = sde.get_alpha_fn()
+        sigma_fn = sde.get_sigma_fn()
+        def denoiser_fn(x_t, y, t):
+            sigma_t, alpha_t = sigma_fn(t), alpha_fn(t)
+            noise_pred = self.forward(x_t, y, t)
+            x_denoised = (x_t - sigma_t * noise_pred) / alpha_t
+            return x_denoised
+        return denoiser_fn
 
     def print_model_summary(self):
         """

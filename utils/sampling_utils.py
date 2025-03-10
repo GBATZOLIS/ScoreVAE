@@ -16,8 +16,8 @@ import os
 import matplotlib
 matplotlib.use('Agg')
 
-def get_score_fn(sde, diffusion_model, train=False):
-    return diffusion_model.get_score_fn(sde, train)
+def get_score_fn(sde, diffusion_model):
+    return diffusion_model.get_score_fn(sde)
 
 def get_inverse_step_fn(discretisation):
     # Discretisation sequence is ordered from biggest time to smallest time
@@ -144,7 +144,7 @@ def evaluation_mode(model):
 def generate_samples(y, sde, diffusion_model, steps, shape, device):
     diffusion_model.to(device)  # Ensure the model is on the correct device
     with evaluation_mode(diffusion_model):
-        score_fn = get_score_fn(sde, diffusion_model, train=False)
+        score_fn = get_score_fn(sde, diffusion_model)
         with torch.no_grad():
             x_mean = Algorithm1(sde, steps, score_fn, shape, device, y)
 
@@ -252,13 +252,11 @@ def get_generation_callback(vis_callback):
     
     return generation_callback
 
-        
-    return generation_callback
 
 
 def generate_specified_num_samples(num_samples, sde, diffusion_model, steps, shape, device):
     with evaluation_mode(diffusion_model):
-        score_fn = get_score_fn(sde, diffusion_model, train=False)
+        score_fn = get_score_fn(sde, diffusion_model)
         with torch.no_grad():
             all_samples = []
             num_iterations = (num_samples + shape[0] - 1) // shape[0]  # Calculate the number of iterations required
@@ -276,7 +274,7 @@ def generate_samples_on_device(device_id, num_samples_per_device, sde, diffusion
     diffusion_model.to(device)
     
     with evaluation_mode(diffusion_model):
-        score_fn = get_score_fn(sde, diffusion_model, train=False)
+        score_fn = get_score_fn(sde, diffusion_model)
 
         with torch.no_grad():  # Ensure no_grad is used to prevent memory leaks
             all_samples = []

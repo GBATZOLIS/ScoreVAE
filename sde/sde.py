@@ -125,6 +125,18 @@ class SNRSDE(SDE):
   def T(self):
     return 1
   
+  def get_alpha_fn(self):
+    """Returns a function that computes alpha_t using numerically stable sigmoid."""
+    def alpha_fn(t):
+        return torch.sqrt(torch.sigmoid(-self.log_SNR(t)))  # α_t = sqrt(sigmoid(-γ(t)))
+    return alpha_fn
+
+  def get_sigma_fn(self):
+    """Returns a function that computes sigma_t using numerically stable sigmoid."""
+    def sigma_fn(t):
+        return torch.sqrt(torch.sigmoid(self.log_SNR(t)))  # σ_t = sqrt(sigmoid(γ(t)))
+    return sigma_fn
+  
   def perturbation_coefficients(self, t):
     SNR = lambda t: torch.exp(self.log_SNR(t))
     alpha = torch.sqrt(SNR(t) / (1 + SNR(t)))
@@ -145,7 +157,6 @@ class SNRSDE(SDE):
     else:
       drift = f * x
       return drift, diffusion
-    
 
   def marginal_prob(self, x, t): 
     SNR = lambda t: torch.exp(self.log_SNR(t))
@@ -198,11 +209,25 @@ class VPSDE(SDE):
     sigma_t = torch.sqrt(1. - torch.exp(2. * log_mean_coeff))
     return a_t, sigma_t 
 
+  def get_alpha_fn(self):
+        """Returns a function that computes alpha_t."""
+        def alpha_fn(t):
+            log_mean_coeff = -0.25 * t ** 2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
+            return torch.exp(log_mean_coeff)
+        return alpha_fn
+
+  def get_sigma_fn(self):
+      """Returns a function that computes sigma_t."""
+      def sigma_fn(t):
+          log_mean_coeff = -0.25 * t ** 2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
+          return torch.sqrt(1. - torch.exp(2. * log_mean_coeff))
+      return sigma_fn
+
   def snr(self, t):
-    log_mean_coeff = -0.25 * t ** 2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
-    alpha_t = torch.exp(log_mean_coeff)
-    std = torch.sqrt(1. - torch.exp(2. * log_mean_coeff))
-    return alpha_t**2/std**2
+      """Computes the signal-to-noise ratio SNR(t) = alpha_t^2 / sigma_t^2."""
+      alpha_t = self.get_alpha_fn()(t)
+      sigma_t = self.get_sigma_fn()(t)
+      return alpha_t**2 / sigma_t**2
 
   def sde(self, x, t, return_f=False):
     beta_t = self.beta_0 + t * (self.beta_1 - self.beta_0)
@@ -255,6 +280,24 @@ class subVPSDE(SDE):
   def T(self):
     return 1
 
+  def get_alpha_fn(self):
+      def alpha_fn(t):
+          log_mean_coeff = -0.25 * t**2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
+          return torch.exp(log_mean_coeff)  # α_t = exp(log_mean_coeff)
+      return alpha_fn
+
+  def get_sigma_fn(self):
+      def sigma_fn(t):
+          log_mean_coeff = -0.25 * t**2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
+          return 1 - torch.exp(2 * log_mean_coeff)  # σ_t = 1 - exp(2 * log_mean_coeff)
+      return sigma_fn
+  
+  def snr(self, t):
+      """Computes the signal-to-noise ratio SNR(t) = alpha_t^2 / sigma_t^2."""
+      alpha_t = self.get_alpha_fn()(t)
+      sigma_t = self.get_sigma_fn()(t)
+      return alpha_t**2 / sigma_t**2
+  
   def sde(self, x, t):
     beta_t = self.beta_0 + t * (self.beta_1 - self.beta_0)
     drift = -0.5 * beta_t[(...,)+(None,)*len(x.shape[1:])] * x

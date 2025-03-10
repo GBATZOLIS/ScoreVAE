@@ -14,7 +14,7 @@ def get_config():
     # Training settings
     config.training = training = ml_collections.ConfigDict()
     ## general training settings
-    training.device = "cuda:3"
+    training.device = "cpu"
     training.gpus = 1  # Number of GPUs to use
     training.epochs = 1000
     training.checkpoint_frequency = 1
@@ -42,7 +42,7 @@ def get_config():
     config.model = model = ml_collections.ConfigDict()
     model.ema_decay = 0.9999
     model.network = 'BeatGANsUNet'
-    model.checkpoint = 'Model_epoch_646_loss_0.025'
+    model.checkpoint = 'Model_epoch_607_loss_0.025_EMA.pth'
     model.model_channels = 128
     model.out_channels = data.num_channels
     model.num_res_blocks = 4
