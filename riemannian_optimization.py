@@ -147,6 +147,7 @@ def get_custom_optim_function(x_target):
 # ---------------------------
 def riemannian_optimization(diff_config, riem_config):
     device = torch.device(diff_config.training.device)
+    print(f'Optimization takes place on device:{device}')
 
     # Prepare logging directories (from the diffusion config)
     _, checkpoint_dir, eval_dir = prepare_training_dirs(diff_config)
