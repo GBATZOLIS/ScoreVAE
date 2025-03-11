@@ -14,7 +14,7 @@ def get_config():
     # Training settings
     config.training = training = ml_collections.ConfigDict()
     ## general training settings
-    training.device = "cpu"
+    training.device = "cuda:0"
     training.gpus = 1  # Number of GPUs to use
     training.epochs = 1000
     training.checkpoint_frequency = 1
