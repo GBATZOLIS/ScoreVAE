@@ -146,10 +146,11 @@ def get_custom_optim_function(x_target):
 # Receives two separate configs: one for diffusion and one for riemannian optimization.
 # ---------------------------
 def riemannian_optimization(diff_config, riem_config):
+    device = torch.device(diff_config.training.device)
+
     # Prepare logging directories (from the diffusion config)
     _, checkpoint_dir, eval_dir = prepare_training_dirs(diff_config)
     #writer = SummaryWriter(log_dir=eval_dir)
-    device = torch.device(diff_config.training.device)
 
     # Load the diffusion dataset using standard dataloaders.
     train_loader, val_loader, test_loader = get_dataloaders(diff_config.data)
@@ -173,6 +174,7 @@ def riemannian_optimization(diff_config, riem_config):
     # Load the diffusion model, SDE, and EMA (from the diffusion config)
     # ---------------------------
     model = get_model(diff_config.model)
+    model = model.to(device)
     sde = configure_sde(diff_config)
     ema_model = EMA(model=model, decay=diff_config.model.ema_decay)
     
@@ -184,7 +186,7 @@ def riemannian_optimization(diff_config, riem_config):
     
     #load_model(model, ema_model, checkpoint_path, "Model", is_ema=False)
     #ema_checkpoint_path = checkpoint_path.replace(".pth", "_EMA.pth")
-    load_model(model, ema_model, checkpoint_path, "Model", is_ema=True)
+    load_model(model, ema_model, checkpoint_path, "Model", device=device, is_ema=True)
     ema_model.apply_shadow()
     model.eval()
 
@@ -225,7 +227,8 @@ def riemannian_optimization(diff_config, riem_config):
     # Define the Euclidean optimization objective from the riemannian config.
     # ---------------------------
     #opt_fn = get_optim_function(riem_config)
-    opt_fn = get_custom_optim_function(x_target=flatten_tensor(dataset_tensor[-1].unsqueeze(0))) #L2 distance from target datapoint.
+    x_target = flatten_tensor(dataset_tensor[-1].unsqueeze(0)).to(device)
+    opt_fn = get_custom_optim_function(x_target)
 
     # ---------------------------
     # Instantiate and run the riemannian optimizer.
@@ -238,7 +241,9 @@ def riemannian_optimization(diff_config, riem_config):
 
     
     #Visualisation of the Riemannian optimisation.
-    data_tensor, alpha_t, sigma_t = dataset_tensor[:250], alpha_fn(t_diff), sigma_fn(t_diff)
+    data_tensor = dataset_tensor[:250].to(device)
+    alpha_t = alpha_fn(t_diff)
+    sigma_t = sigma_fn(t_diff)
     perturbed_points = alpha_t * data_tensor + sigma_t * torch.randn_like(data_tensor)
     trajectory = [t.detach().cpu() for t in trajectory]
     min_point = torch.tensor(riem_config["min_point"], dtype=torch.float32, device=device).detach().cpu().numpy()

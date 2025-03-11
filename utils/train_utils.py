@@ -126,8 +126,9 @@ def save_model(model, ema_model, epoch, loss, model_name, checkpoint_dir, best_c
             print(f"{model_name} EMA model saved at '{new_ema_checkpoint_path}'")
 
 
-def load_model(model, ema_model, checkpoint_path, model_name, optimizer=None, scheduler=None, is_ema=False):
-    checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+def load_model(model, ema_model, checkpoint_path, model_name, device=torch.device('cpu'), optimizer=None, scheduler=None, is_ema=False):
+    # Load checkpoint to the provided device.
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     if is_ema:
         for name, data in checkpoint['model_state_dict'].items():
             ema_model.shadow[name].copy_(data)
@@ -151,8 +152,6 @@ def load_model(model, ema_model, checkpoint_path, model_name, optimizer=None, sc
     
     return epoch, loss, global_step, best_checkpoints, best_val_loss, epochs_no_improve
 
-
-
 def resume_training(config, model, ema_model, load_model_func, get_optimizer_and_scheduler_func):
     optimizer, scheduler = get_optimizer_and_scheduler_func(model, config)
     if hasattr(config.model, 'checkpoint') and config.model.checkpoint:
@@ -163,10 +162,16 @@ def resume_training(config, model, ema_model, load_model_func, get_optimizer_and
             checkpoint_path += '.pth'
         
         # Load standard model
-        epoch, loss, global_step, best_checkpoints, best_val_loss, epochs_no_improve = load_model_func(model, ema_model, checkpoint_path, "Model", optimizer, scheduler, is_ema=False)
+        epoch, loss, global_step, best_checkpoints, best_val_loss, epochs_no_improve = load_model_func(
+            model, ema_model, checkpoint_path, "Model", device=torch.device(config.training.device),
+            optimizer=optimizer, scheduler=scheduler, is_ema=False
+        )
         # Load EMA model
         ema_checkpoint_path = checkpoint_path.replace('.pth', '_EMA.pth')
-        _, _, _, _, _, _ = load_model_func(model, ema_model, ema_checkpoint_path, "Model", is_ema=True)
+        _, _, _, _, _, _ = load_model_func(
+            model, ema_model, ema_checkpoint_path, "Model", device=torch.device(config.training.device),
+            is_ema=True
+        )
         
         print(f"Resuming training from epoch {epoch + 1}")
         
