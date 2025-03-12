@@ -38,10 +38,10 @@ CONFIG = {
     "momentum_coeff": 0.8,
 
     # Settings for fast calculation of Riemannian gradient via CG
-    "cg_preconditioner": 'diagonal',
+    "cg_preconditioner": None,
     "cg_precond_diag_samples": 10, 
     "cg_tol": 5e-5, 
-    "cg_max_iter": 4,
+    "cg_max_iter": 30,
 
     # Objective function parameters
     "min_point": [[1.1, 0.05]],
