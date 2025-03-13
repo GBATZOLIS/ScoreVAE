@@ -5,7 +5,7 @@ def get_config():
 
     # Logging settings
     config.base_log_dir = "./results"
-    config.experiment = "check_deep_sphere"
+    config.experiment = "earth-deep"
     config.tensorboard_dir = f"{config.base_log_dir}/{config.experiment}/training_logs"
     config.checkpoint_dir = f"{config.base_log_dir}/{config.experiment}/checkpoints"
     config.eval_dir = f"{config.base_log_dir}/{config.experiment}/eval"
@@ -31,27 +31,23 @@ def get_config():
 
     # Data settings
     config.data = data = ml_collections.ConfigDict()
-    data.batch_size = 64
-    data.dataset = 'sphere'
-    data.data_samples = 10000
-    data.n_spheres = 1
-    data.ambient_dim = 2         # ambient dimension: 2 for a 1d sphere in 2D
-    data.manifold_dim = 1
-    data.noise_std = 0.0
-    data.embedding_type = 'random_isometry'
-    data.radii = []
-    data.angle_std = -1
+    data.data_path = '/Users/gbatz97/Desktop/landseamask_water-global.nc'
+    data.batch_size = 128
+    data.dataset = 'earth'
+    data.data_samples = 50000
+    data.ambient_dim = 3        # ambient dimension: 2 for a 1d sphere in 2D
+    data.manifold_dim = 2
     data.shape = [data.ambient_dim]
 
     # Model settings
     config.model = model = ml_collections.ConfigDict()
     model.network = 'mlp'
-    model.checkpoint = 'Model_epoch_139_loss_0.153'
+    model.checkpoint = 'Model_epoch_179_loss_0.135.pth'
     model.state_size = data.ambient_dim  # same as ambient_dim
     model.hidden_dim = 512
-    model.depth = 3
+    model.depth = 4
     model.dropout = 0.0
-    model.ema_decay = 0.999
+    model.ema_decay = 0.9999
 
     # Optimization settings
     config.optim = optim = ml_collections.ConfigDict()

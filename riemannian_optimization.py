@@ -158,7 +158,7 @@ def riemannian_optimization(diff_config, riem_config):
     
     # Select initial point(s) from the **entire** training dataset.
     dataset = train_loader.dataset
-    num_points = riem_config.get("num_points", 2)
+    num_points = riem_config.get("num_points", 24)
     
     # Convert dataset to a full tensor if necessary
     if isinstance(dataset, torch.utils.data.Dataset):
@@ -228,8 +228,9 @@ def riemannian_optimization(diff_config, riem_config):
     # Define the Euclidean optimization objective from the riemannian config.
     # ---------------------------
     #opt_fn = get_optim_function(riem_config)
-    x_target = flatten_tensor(dataset_tensor[-1].unsqueeze(0)).to(device)
-    opt_fn = get_custom_optim_function(x_target)
+    #x_target = flatten_tensor(dataset_tensor[-1].unsqueeze(0)).to(device)
+    #opt_fn = get_custom_optim_function(x_target)
+    opt_fn = get_optim_function(riem_config)
 
     # ---------------------------
     # Instantiate and run the riemannian optimizer.
@@ -242,7 +243,7 @@ def riemannian_optimization(diff_config, riem_config):
 
     
     #Visualisation of the Riemannian optimisation.
-    data_tensor = dataset_tensor[:250].to(device)
+    data_tensor = dataset_tensor[:2500].to(device)
     alpha_t = alpha_fn(t_diff)
     sigma_t = sigma_fn(t_diff)
     perturbed_points = alpha_t * data_tensor + sigma_t * torch.randn_like(data_tensor)

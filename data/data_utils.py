@@ -1,6 +1,7 @@
 from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 from .sphere import KSphereDataset
+from .earth import EarthDataset
 
 def get_dataloaders(args):
     dataset_name = args.dataset
@@ -42,7 +43,17 @@ def get_dataloaders(args):
         train_size = int(0.9 * len(full_train_dataset))
         val_size = len(full_train_dataset) - train_size
         train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
+    elif dataset_name == 'earth':
+        # Create an EarthDataset from your config/args
+        dataset = EarthDataset(args)
         
+        # Same style of split (90/10/0), or adjust if you want e.g. 80/10/10
+        train_size = int(0.9 * len(dataset))
+        val_size   = int(0.1 * len(dataset))
+        test_size  = len(dataset) - train_size - val_size
+        
+        train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
+
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
 
