@@ -31,7 +31,7 @@ def get_config():
 
     # Data settings
     config.data = data = ml_collections.ConfigDict()
-    data.data_path = '/Users/gbatz97/Desktop/landseamask_water-global.nc'
+    data.data_path = '/home/gb511/data/landseamask_water-global.nc'
     data.batch_size = 128
     data.dataset = 'earth'
     data.data_samples = 50000
