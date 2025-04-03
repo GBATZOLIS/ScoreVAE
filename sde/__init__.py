@@ -4,7 +4,7 @@ from scipy.interpolate import PchipInterpolator
 import torch
 import numpy as np
 
-def configure_sde(config):
+def configure_sde(config, device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')):
     sampling_eps = 1e-5  # Default sampling epsilon
     sde = None
 
@@ -19,7 +19,7 @@ def configure_sde(config):
         if hasattr(config.training, 'beta_schedule'):
             # DISCRETE QUANTITIES
             N = 1000
-            betas = get_named_beta_schedule('linear', N)
+            betas = get_named_beta_schedule(config.training.beta_schedule, N)
             alphas = 1.0 - betas
             alphas_cumprod = np.cumprod(alphas, axis=0)
             discrete_snrs = alphas_cumprod / (1.0 - alphas_cumprod)
@@ -29,12 +29,12 @@ def configure_sde(config):
             d_snr = snr.derivative(nu=1)
 
             def logsnr(t):
-                device = t.device
+                t = torch.tensor(t, device=device)  # Convert float to tensor on the correct device
                 snr_val = torch.from_numpy(snr(t.cpu().numpy())).float().to(device)
                 return torch.log(snr_val)
 
             def d_logsnr(t):
-                device = t.device
+                t = torch.tensor(t, device=device)  # Convert float to tensor on the correct device
                 dsnr_val = torch.from_numpy(d_snr(t.cpu().numpy())).float().to(device)
                 snr_val = torch.from_numpy(snr(t.cpu().numpy())).float().to(device)
                 return dsnr_val / snr_val

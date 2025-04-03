@@ -116,7 +116,6 @@ class SNRSDE(SDE):
       log_SNR = lambda t: - (minus_log_SNR_0 +  normalizing_consant * (gamma(t) - gamma(0)))
       self.d_log_SNR = lambda t: -normalizing_consant * d_gamma(t)
       self.log_SNR = log_SNR
-
     else:
         self.log_SNR = gamma
         self.d_log_SNR = dgamma
@@ -125,6 +124,13 @@ class SNRSDE(SDE):
   def T(self):
     return 1
   
+  def edm_sigma(self, t):
+    return torch.exp(-0.5*self.log_SNR(t))
+  
+  def edm_s(self, t):
+    SNR = lambda t: torch.exp(self.log_SNR(t))
+    return torch.sqrt(SNR(t) / (1 + SNR(t)))
+
   def perturbation_coefficients(self, t):
     SNR = lambda t: torch.exp(self.log_SNR(t))
     alpha = torch.sqrt(SNR(t) / (1 + SNR(t)))

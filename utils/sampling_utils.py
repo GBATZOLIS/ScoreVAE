@@ -11,7 +11,8 @@ from torch.nn import DataParallel
 import torch.multiprocessing as mp
 import ctypes  # Add this line
 import os 
-
+from scipy.interpolate import PchipInterpolator
+from sde.sde import *
 # Set the Matplotlib backend to Agg
 import matplotlib
 matplotlib.use('Agg')
@@ -252,9 +253,6 @@ def get_generation_callback(vis_callback):
     
     return generation_callback
 
-        
-    return generation_callback
-
 
 def generate_specified_num_samples(num_samples, sde, diffusion_model, steps, shape, device):
     with evaluation_mode(diffusion_model):
@@ -384,36 +382,69 @@ def karras_preferred_timesteps(sde, num_steps, rho):
             return (edm_sigma_max**(1/rho) + step/(integration_steps-1) * (edm_sigma_min**(1/rho) - edm_sigma_max**(1/rho)))**rho
         return parametrized_edm_sigma_fn
     
-    def get_inverse_edm_sigma_fn(sde):
-        beta_d = sde.beta_1 - sde.beta_0
-        beta_0 = sde.beta_0
-        
-        def inverse_edm_sigma_fn(edm_sigma_t):
-            # Compute coefficients
-            a = 0.5 * beta_d
-            b = beta_0
-            c = -torch.log(edm_sigma_t**2 + 1)
+    if isinstance(sde, SNRSDE):
+        def get_inverse_edm_sigma_fn(sde):
+            from scipy.optimize import root_scalar
 
-            # Compute the discriminant
-            discriminant = b**2 - 4 * a * c
+            def inverse_edm_sigma_fn(edm_sigma_t):
+                """Finds t such that f(t) = x using root-finding"""
+                def f(t, sigma):
+                    # Ensure we get a scalar value
+                    edm_value = sde.edm_sigma(t)
+                    if edm_value.dim() > 0:  # Check if it's a tensor with more than one element
+                        edm_value = edm_value.item()  # Convert to a Python scalar
+                    return edm_value - sigma  # Compare with the scalar sigma
 
-            # Compute the positive root of the quadratic equation
-            t = (-b + torch.sqrt(discriminant)) / (2 * a)
+                roots = []
+                if edm_sigma_t.dim() > 0:  # Only iterate if edm_sigma_t has more than 0 dimensions
+                    for sigma in edm_sigma_t:  # Iterate over each element in edm_sigma_t
+                        root_result = root_scalar(f, args=(sigma.item(),), bracket=[0., 1.], method='brentq')
+                        if root_result.converged:
+                            roots.append(root_result.root)
+                        else:
+                            roots.append(float('nan'))  # Handle non-convergence
+                else:
+                    # Handle the case where edm_sigma_t is a single scalar
+                    root_result = root_scalar(f, args=(edm_sigma_t.item(),), bracket=[0., 1.], method='brentq')
+                    if root_result.converged:
+                        roots.append(root_result.root)
+                    else:
+                        roots.append(float('nan'))  # Handle non-convergence
+
+                return torch.tensor(roots)  # Return as a tensor
             
-            return t
+            return inverse_edm_sigma_fn
         
-        return inverse_edm_sigma_fn
+    else:
+        def get_inverse_edm_sigma_fn(sde):
+            beta_d = sde.beta_1 - sde.beta_0
+            beta_0 = sde.beta_0
+            
+            def inverse_edm_sigma_fn(edm_sigma_t):
+                # Compute coefficients
+                a = 0.5 * beta_d
+                b = beta_0
+                c = -torch.log(edm_sigma_t**2 + 1)
+
+                # Compute the discriminant
+                discriminant = b**2 - 4 * a * c
+
+                # Compute the positive root of the quadratic equation
+                t = (-b + torch.sqrt(discriminant)) / (2 * a)
+                
+                return t
+            
+            return inverse_edm_sigma_fn
     
     inverse_edm_sigma_fn = get_inverse_edm_sigma_fn(sde)
 
     #C.1.4 Karras paper.
-    edm_sigma_min = torch.tensor(0.002)
+    edm_sigma_min = torch.tensor(0.0105)
     time_edm_sigma_min = inverse_edm_sigma_fn(edm_sigma_min)
     print(f'Min diffusion time: {time_edm_sigma_min.item()}')
     edm_sigma_max = torch.tensor(80)
     time_edm_sigma_max = inverse_edm_sigma_fn(edm_sigma_max)
     print(f'Max diffusion time: {time_edm_sigma_max.item()}')
-
     steps = torch.arange(num_steps)
     parametrized_edm_sigma_fn = get_parametrized_edm_sigma_fn(rho, edm_sigma_min, edm_sigma_max, num_steps)
     parametrized_edm_sigmas = parametrized_edm_sigma_fn(steps)
@@ -450,7 +481,7 @@ def inspect_timesteps(sde, num_steps, eval_dir):
     inverse_edm_sigma_fn = get_inverse_edm_sigma_fn(sde)
 
     #C.1.4 Karras paper.
-    edm_sigma_min = torch.tensor(0.002)
+    edm_sigma_min = torch.tensor(0.02)
     time_edm_sigma_min = inverse_edm_sigma_fn(edm_sigma_min)
     print(f'Min diffusion time: {time_edm_sigma_min.item()}')
     edm_sigma_max = torch.tensor(80)

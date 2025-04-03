@@ -1,11 +1,16 @@
 import ml_collections
 from datetime import timedelta
+import os
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from torch.cuda.amp import autocast
 
 def get_config():
     config = ml_collections.ConfigDict()
 
     # Logging settings
-    config.base_log_dir = "./results/cifar10"
+    config.base_log_dir = "./results/ffhq"
     config.experiment = "scoreVAE_noise"
     config.tensorboard_dir = f"{config.base_log_dir}/{config.experiment}/training_logs"
     config.checkpoint_dir = f"{config.base_log_dir}/{config.experiment}/checkpoints"
@@ -16,46 +21,65 @@ def get_config():
     ## general training settings
     training.device = "cuda:0"
     training.gpus = 1  # Number of GPUs to use
-    training.epochs = 1000
+    training.epochs = 10000
     training.checkpoint_frequency = 1
     training.patience_epochs = 300
     ## settings for the generation callback during training
     training.vis_callback = 'scoreVAE'
-    training.vis_frequency = 20 #generate data every vis_frequency epochs
-    training.fid_eval_frequency = 2000 #FID evaluation frequency
+    training.vis_frequency = 1 #generate data every vis_frequency epochs
+    training.fid_eval_frequency = 2500 #FID evaluation frequency
     training.steps = 128 #number of integration steps
-    training.num_samples = 128 #number of samples to generate
+    training.num_samples = 16 #number of samples to generate
     ## settings for forward SDE + loss function
-    training.sde = 'vpsde'
+    training.sde = 'snrsde'
     training.loss = "scoreVAE_loss" #ScoreVAE setting
     training.likelihood_weighting = False
-    training.kl_weight = 1e-3 #ScoreVAE setting
+    training.kl_weight = 1e-4 #ScoreVAE setting
+    training.continuous = True
+    training.t_dependent = True
+    training.t_batch_size = 1
+    training.variational = True
+    training.use_pretrained = True
+    training.prior_checkpoint_path = "/home/rg625/mnt/ScoreVAE/scoreVAE checkpoints/ffhq/prior/cheackpoints/epoch=141--eval_loss_epoch=0.014.ckpt"
+    training.prior_config_path = "/home/rg625/mnt/ScoreVAE/scoreVAE checkpoints/ffhq/prior/config.pkl"
+    training.beta_schedule = 'linear'
 
     # Data settings
     config.data = data = ml_collections.ConfigDict()
-    data.batch_size = 128
-    data.dataset = 'CIFAR10'
-    data.image_size = 32
+    data.batch_size = 16
+    data.dataset = 'FFHQ'
+    data.image_size = 128
     data.num_channels = 3
     data.shape = [data.num_channels, data.image_size, data.image_size]
-    data.latent_dim = 384 #scoreVAE setting
+    data.latent_dim = 512 #scoreVAE setting
+    data.base_dir = os.path.expanduser("~/datasets/ffhq")
+    data.centered = True
+    data.class_cond = False
+    data.create_dataset = False
+    data.datamodule = "guided_diffusion_dataset"
+    data.percentage_use = 100
+    data.random_crop = False
+    data.random_flip = False
+    data.return_labels = False
+    data.split = [0.9, 0.05, 0.05]
+    data.use_data_mean = False
 
     # Model settings
     config.model = model = ml_collections.ConfigDict()
-    model.ema_decay = 0.9999
+    model.ema_decay = 0.999
     model.network = 'CombinedDiffusionEncoder'
 
     # Pretrained Diffusion Model settings
     config.model.diffusion_model = diffusion_model = ml_collections.ConfigDict()
     diffusion_model.network = 'BeatGANsUNet'
-    diffusion_model.checkpoint = '/home/rg625/mnt/ScoreVAE/results/cifar10/unconditional/checkpoints/Model_epoch_390_loss_0.026.pth'
+    diffusion_model.checkpoint = 'ffhq_checkpoints/ffhq/prior/cheackpoints/epoch=141--eval_loss_epoch=0.014.ckpt'
     diffusion_model.model_channels = 128
     diffusion_model.out_channels = data.num_channels
-    diffusion_model.num_res_blocks = 4
+    diffusion_model.num_res_blocks = 2
     diffusion_model.embed_channels = 512
     diffusion_model.attention_resolutions = (16,)
-    diffusion_model.dropout = 0.1
-    diffusion_model.channel_mult = (1, 2, 2, 2)
+    diffusion_model.dropout = 0.0
+    diffusion_model.channel_mult = (1, 1, 2, 3, 4)
     diffusion_model.input_channel_mult = None
     diffusion_model.conv_resample = True
     diffusion_model.dims = 2
@@ -77,19 +101,19 @@ def get_config():
     # Encoder settings
     config.model.encoder = encoder = ml_collections.ConfigDict()
     encoder.network = 'BeatGANsEncoderModel'
-    encoder.model_channels = 64
+    encoder.model_channels = 128
     encoder.enc_num_res_blocks = 2
     encoder.latent_dim = data.latent_dim
     encoder.enc_attn_resolutions = ()
     encoder.enc_use_time_condition = True
-    encoder.enc_channel_mult = (1, 1, 2, 4)
+    encoder.enc_channel_mult = (1, 1, 2, 3, 4, 4)
     encoder.enc_pool = 'flatten-linear'
-    encoder.resolution_before_flattening = data.image_size // 2**(len(encoder.enc_channel_mult)-1)
+    encoder.resolution_before_flattening = 4
     encoder.resblock_updown = False
     encoder.encoder_input_channels = data.num_channels
-    encoder.enc_out_channels = 2 * data.latent_dim
+    encoder.enc_out_channels = 1024
     encoder.encoder_split_output = False
-    encoder.dropout = 0
+    encoder.dropout = 0.0
     encoder.dims = 2
     encoder.image_size = data.image_size
     encoder.in_channels = data.num_channels
@@ -106,20 +130,38 @@ def get_config():
 
     # Optimization settings
     config.optim = optim = ml_collections.ConfigDict()
-    optim.weight_decay = 0.01  # Updated weight decay
-    optim.optimizer = 'AdamW'  # Use AdamW optimizer
-    optim.lr = 2e-4  # Updated learning rate
+    optim.weight_decay = 0.0
+    optim.optimizer = 'Adam'
+    optim.lr = 5e-5
     optim.beta1 = 0.9
-    optim.beta2 = 0.99  # Updated beta2
+    optim.beta2 = 0.99
     optim.eps = 1e-8
-    optim.warmup = 5000
+    optim.warmup = 1000
     optim.grad_clip = 1.0
+    optim.slowing_factor = 1
+    optim.accumulation_steps = 1
 
     # Evaluation settings
     config.evaluation = evaluation = ml_collections.ConfigDict()
-    evaluation.devices = [0,1,2]
+    evaluation.devices = [0]
     evaluation.eval_callback_epochs = 20
     evaluation.num_eval_points = 10
     evaluation.eval_save_path = "./eval"
+    evaluation.batch_size = 16
+    evaluation.workers = 4
+    evaluation.enable_bpd = False
+    evaluation.enable_loss = True
+    evaluation.enable_sampling = True
+    evaluation.num_samples = 50000
 
-    return config
+    # Sampling settings
+    config.sampling = sampling = ml_collections.ConfigDict()
+    sampling.corrector = "conditional_none"
+    sampling.method = "pc"
+    sampling.n_steps_each = 1
+    sampling.noise_removal = True
+    sampling.predictor = "conditional_ddim"
+    sampling.probability_flow = False
+    sampling.snr = 0.15
+
+    return config 

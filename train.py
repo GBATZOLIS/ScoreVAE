@@ -6,6 +6,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import argparse
 import pickle
+from torch.cuda.amp import autocast
 
 from data.data_utils import get_dataloaders
 from models import get_model
@@ -43,21 +44,31 @@ def train(config):
     loss_fn = get_loss_fn(config, sde, t_dist)
     generation_callback = get_generation_callback(config.training.vis_callback)
 
+    accumulation_steps = config.optim.accumulation_steps  # Define this in your config
+
     for epoch in range(epoch, config.training.epochs):
         model.train()
         train_loss = 0
-        for data in tqdm(train_loader, desc=f"Training Epoch {epoch + 1}/{config.training.epochs}"):
+        optimizer.zero_grad()  # Reset gradients at the start of each epoch
+        with tqdm(train_loader, desc=f"Training Epoch {epoch + 1}/{config.training.epochs}", leave=False) as pbar:
+            for i, data in enumerate(pbar):
+                batch = prepare_batch(data, device)
+                with autocast():  # Enable mixed precision
+                    loss = loss_fn(model, batch, train=True)
+                    pbar.set_postfix(loss=loss.item())  # Print the loss in tqdm
+                batch = prepare_batch(data, device)
             batch = prepare_batch(data, device)
 
-            optimizer.zero_grad()
-            loss = loss_fn(model, batch, train=True)
-
             loss.backward()
+
+            # Gradient clipping
             if config.optim.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.optim.grad_clip)
-            optimizer.step()
-            ema_model.update()
-            scheduler.step()
+
+            # Accumulate gradients
+            if (i + 1) % accumulation_steps == 0:
+                optimizer.step()  # Update weights
+                optimizer.zero_grad()  # Reset gradients for the next accumulation
 
             train_loss += loss.item()
             writer.add_scalar('Loss/Train', loss.item(), global_step)

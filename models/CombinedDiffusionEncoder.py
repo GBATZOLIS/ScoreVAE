@@ -28,8 +28,21 @@ class CombinedDiffusionEncoder(nn.Module):
         if not checkpoint_path:
             raise ValueError("Pretrained weights for the diffusion model are required. Please provide a valid checkpoint path.")
 
-        checkpoint = torch.load(checkpoint_path)
-        self.diffusion_model.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint = torch.load(checkpoint_path, map_location='cuda:0')
+        print(f'Loading checkpoint form :{checkpoint_path}')
+        if 'pytorch-lightning_version' in checkpoint.keys():
+            new_state_dict = {}
+            for key, value in checkpoint['state_dict'].items():
+                if key.startswith('score_model.'):
+                    new_key = key[len('score_model.'):]  # Remove the prefix
+                    new_state_dict[new_key] = value
+                else:
+                    new_state_dict[key] = value  # Keep the original key if it doesn't have the prefix
+
+            # Load the modified state_dict into the model
+            self.diffusion_model.load_state_dict(new_state_dict)
+        else:
+            self.diffusion_model.load_state_dict(checkpoint['model_state_dict'])
         print(f"Loaded pretrained weights from {checkpoint_path}")
 
         # Freeze the diffusion model to prevent any training
