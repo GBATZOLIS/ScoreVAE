@@ -40,8 +40,8 @@ def get_config():
     training.t_batch_size = 1
     training.variational = True
     training.use_pretrained = True
-    training.prior_checkpoint_path = "/home/rg625/mnt/ScoreVAE/scoreVAE checkpoints/ffhq/prior/cheackpoints/epoch=141--eval_loss_epoch=0.014.ckpt"
-    training.prior_config_path = "/home/rg625/mnt/ScoreVAE/scoreVAE checkpoints/ffhq/prior/config.pkl"
+    training.prior_checkpoint_path = "ffhq_checkpoints/ffhq/prior/cheackpoints/epoch=141--eval_loss_epoch=0.014.ckpt"
+    training.prior_config_path = "ffhq_checkpoints/ffhq/prior/config.pkl"
     training.beta_schedule = 'linear'
 
     # Data settings

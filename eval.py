@@ -1,17 +1,18 @@
 import os
+import pickle
+from argparse import ArgumentParser
+
 import torch
 import torch.multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
-from argparse import ArgumentParser
-import pickle
 
+from configs import load_config
 from data.data_utils import get_dataloaders
+from evaluation.fid import fid_evaluation_callback
 from models import get_model
 from sde import configure_sde
-from utils.train_utils import prepare_training_dirs, EMA, load_model
-from utils.sampling_utils import generation_callback
-from configs import load_config
-from evaluation.fid import fid_evaluation_callback
+from utils.sampling_utils import get_generation_callback
+from utils.train_utils import EMA, load_model, prepare_training_dirs
 
 def eval_fid(config):
     _, checkpoint_dir, eval_dir = prepare_training_dirs(config)
@@ -42,6 +43,9 @@ def eval_fid(config):
 
     # Generate the plot and save it in eval_dir
     #practical_infer_timesteps(sde, steps)
+
+    # Get the generation callback function
+    generation_callback = get_generation_callback('base')  # or 'scoreVAE' depending on your model type
 
     # Generate samples and save to TensorBoard
     #generation_callback(None, writer, sde, model, steps, shape, torch.device(f'cuda:{device_ids[0]}'), 0)

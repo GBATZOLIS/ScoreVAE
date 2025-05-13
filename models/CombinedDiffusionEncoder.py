@@ -219,7 +219,7 @@ class CombinedDiffusionEncoder(nn.Module):
                 log_var_z_flat = log_var_z.view(log_var_z.size(0), -1)
                 z_flat = z.view(z.size(0), -1)
 
-                logdensity = -0.5 * torch.sum(torch.square(z_flat - mean_z_flat) / log_var_z_flat.exp(), dim=1)
+                logdensity = -0.5 * torch.sum(torch.square(z_flat - mean_z_flat) / log_var_z_flat.exp() - log_var_z_flat, dim=1)
                 return logdensity
 
             if not train: 

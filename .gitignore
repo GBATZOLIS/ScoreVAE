@@ -1,3 +1,16 @@
 *.pyc
 results/
 datasets/
+
+*.yaml
+*.pkl
+*.ckpt
+*.pt
+*.pth
+*.txt
+
+**/wandb/latest-run
+**/wandb/settings
+**/thumbnails128x128
+**/ffhq_checkpoints
+**/cifar10_checkpoints

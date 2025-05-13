@@ -222,7 +222,6 @@ def get_generation_callback(vis_callback):
                     # Save the plot to TensorBoard with epoch number in the tag
                     save_plot_to_tensorboard(writer, fig, f'Generated Samples/Epoch {epoch + 1}', epoch)
                 
-                
                 # Plot and save the histogram of norms
                 plot_and_save_histogram_of_norms(samples, writer, epoch)
             elif len(samples.shape[1:]) == 3: #assume images of shape (channels, width, height)
@@ -236,17 +235,23 @@ def get_generation_callback(vis_callback):
                 writer.add_image(f'Generated Images', grid, epoch)
     
     elif vis_callback == 'scoreVAE':
-        def generation_callback(batch, writer, sde, diffusion_model, steps, shape, device, epoch):
+        def generation_callback(batch, writer, sde, model, steps, shape, device, epoch):
             x, y = batch
-            z = diffusion_model.encode(x)  # Get the latent representation
+            z = model.encode(x)  # Get the latent representation
             cond = [y, z]
-            reconstruction = generate_samples(cond, sde, diffusion_model, steps, shape, device)
+            reconstruction = generate_samples(cond, sde, model, steps, shape, device)
+
+            unconditional_reconstruction = generate_samples(None, sde, model.diffusion_model, steps, shape, device)
             
             # Visualize reconstructions
             num_rows = int(math.sqrt(reconstruction.shape[0]))
             grid_reconstruction = vutils.make_grid(reconstruction, nrow=num_rows, normalize=True, scale_each=True)
             writer.add_image(f'Reconstruction', grid_reconstruction, epoch)
-            
+
+            num_rows = int(math.sqrt(unconditional_reconstruction.shape[0]))
+            grid_unconditional_reconstruction = vutils.make_grid(unconditional_reconstruction, nrow=num_rows, normalize=True, scale_each=True)
+            writer.add_image(f'Unconditional Reconstruction', grid_unconditional_reconstruction, epoch)
+
             # Visualize original images
             grid_original = vutils.make_grid(x, nrow=num_rows, normalize=True, scale_each=True)
             writer.add_image(f'Original', grid_original, epoch)

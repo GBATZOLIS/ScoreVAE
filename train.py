@@ -51,6 +51,15 @@ def train(config):
         train_loss = 0
         optimizer.zero_grad()  # Reset gradients at the start of each epoch
         with tqdm(train_loader, desc=f"Training Epoch {epoch + 1}/{config.training.epochs}", leave=False) as pbar:
+            steps = config.training.steps
+            num_samples = config.training.num_samples
+            shape = (num_samples, *config.data.shape)
+
+            data = next(iter(val_loader))
+            batch = prepare_batch(data, device)
+            generation_callback(batch, writer, sde, model, steps, shape, device, epoch)
+
+            
             for i, data in enumerate(pbar):
                 batch = prepare_batch(data, device)
                 with autocast():  # Enable mixed precision

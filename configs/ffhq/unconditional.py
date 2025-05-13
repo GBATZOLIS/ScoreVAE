@@ -1,12 +1,12 @@
 import ml_collections
 from datetime import timedelta
-
+import os
 def get_config():
     config = ml_collections.ConfigDict()
 
     # Logging settings
     config.base_log_dir = "./results/ffhq"
-    config.experiment = "unconditional"
+    config.experiment = "unconditional_resume"
     config.tensorboard_dir = f"{config.base_log_dir}/{config.experiment}/training_logs"
     config.checkpoint_dir = f"{config.base_log_dir}/{config.experiment}/checkpoints"
     config.eval_dir = f"{config.base_log_dir}/{config.experiment}/eval"
@@ -20,31 +20,29 @@ def get_config():
     training.checkpoint_frequency = 1
     training.patience_epochs = 300
     ## settings for the generation callback during training
-    training.vis_callback = 'unconditional'
-    training.vis_frequency = 10 #generate data every vis_frequency epochs
+    training.vis_callback = 'base'
+    training.vis_frequency = 1 #generate data every vis_frequency epochs
     training.fid_eval_frequency = 2500 #FID evaluation frequency
     training.steps = 128 #number of integration steps
-    training.num_samples = 128 #number of samples to generate
+    training.num_samples = 16 #number of samples to generate
     ## settings for forward SDE + loss function
     training.sde = 'snrsde'
-    training.loss = "score_loss"
+    training.loss = "simple_DSM_loss"
     training.likelihood_weighting = False
     training.continuous = True
     training.t_dependent = True
     training.t_batch_size = 1
     training.variational = True
-    training.use_pretrained = True
-    training.prior_checkpoint_path = "/home/rg625/mnt/ScoreVAE/scoreVAE checkpoints/ffhq/prior/cheackpoints/epoch=141--eval_loss_epoch=0.014.ckpt"
-    training.prior_config_path = "/home/rg625/mnt/ScoreVAE/scoreVAE checkpoints/ffhq/prior/config.pkl"
+    training.beta_schedule = 'linear'
 
     # Data settings
     config.data = data = ml_collections.ConfigDict()
-    data.batch_size = 64
+    data.batch_size = 16
     data.dataset = 'FFHQ'
     data.image_size = 128
     data.num_channels = 3
     data.shape = [data.num_channels, data.image_size, data.image_size]
-    data.base_dir = "home/datasets/"
+    data.base_dir = os.path.expanduser("~/datasets/ffhq")
     data.centered = True
     data.class_cond = False
     data.create_dataset = False
@@ -84,7 +82,7 @@ def get_config():
     model.num_input_res_blocks = None
     model.image_size = data.image_size
     model.in_channels = data.num_channels
-    model.checkpoint = "/home/rg625/mnt/ScoreVAE/results/ffhq/unconditional/checkpoints/Model_epoch_390_loss_0.026.pth"
+    model.checkpoint = "/home/rg625/mnt/ScoreVAE/ffhq_checkpoints/ffhq/prior/cheackpoints/epoch=141--eval_loss_epoch=0.014.ckpt"
 
     # Optimization settings
     config.optim = optim = ml_collections.ConfigDict()
@@ -97,14 +95,15 @@ def get_config():
     optim.warmup = 1000
     optim.grad_clip = 1.0
     optim.slowing_factor = 1
+    optim.accumulation_steps = 1
 
     # Evaluation settings
     config.evaluation = evaluation = ml_collections.ConfigDict()
-    evaluation.devices = [0,1,2]
+    evaluation.devices = [0]
     evaluation.eval_callback_epochs = 20
     evaluation.num_eval_points = 10
     evaluation.eval_save_path = "./eval"
-    evaluation.batch_size = 64
+    evaluation.batch_size = 16
     evaluation.workers = 4
     evaluation.enable_bpd = False
     evaluation.enable_loss = True
