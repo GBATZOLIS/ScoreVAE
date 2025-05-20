@@ -5,7 +5,7 @@ def get_config():
     config = ml_collections.ConfigDict()
 
     # Logging settings
-    config.base_log_dir = "./results/cifar10"
+    config.base_log_dir = "./results/ffhq"
     config.experiment = "scoreVAE_noise"
     config.tensorboard_dir = f"{config.base_log_dir}/{config.experiment}/training_logs"
     config.checkpoint_dir = f"{config.base_log_dir}/{config.experiment}/checkpoints"
@@ -33,12 +33,12 @@ def get_config():
 
     # Data settings
     config.data = data = ml_collections.ConfigDict()
-    data.batch_size = 128
-    data.dataset = 'CIFAR10'
-    data.image_size = 32
+    data.batch_size = 24
+    data.dataset = 'FFHQ'
+    data.image_size = 128
     data.num_channels = 3
     data.shape = [data.num_channels, data.image_size, data.image_size]
-    data.latent_dim = 384 #scoreVAE setting
+    data.latent_dim = 512 #scoreVAE setting
 
     # Model settings
     config.model = model = ml_collections.ConfigDict()
@@ -48,14 +48,14 @@ def get_config():
     # Pretrained Diffusion Model settings
     config.model.diffusion_model = diffusion_model = ml_collections.ConfigDict()
     diffusion_model.network = 'BeatGANsUNet'
-    diffusion_model.checkpoint = '/home/rg625@ad.eng.cam.ac.uk/mnt/ScoreVAE/results/cifar10/unconditional/checkpoints/Model_epoch_390_loss_0.026.pth'
+    diffusion_model.checkpoint = '/home/rg625@ad.eng.cam.ac.uk/mnt/ScoreVAE/results/ffhq/unconditional/checkpoints/epoch=141--eval_loss_epoch=0.014.ckpt'
     diffusion_model.model_channels = 128
     diffusion_model.out_channels = data.num_channels
-    diffusion_model.num_res_blocks = 4
+    diffusion_model.num_res_blocks = 2
     diffusion_model.embed_channels = 512
     diffusion_model.attention_resolutions = (16,)
     diffusion_model.dropout = 0.1
-    diffusion_model.channel_mult = (1, 2, 2, 2)
+    diffusion_model.channel_mult = (1, 1, 2, 3, 4)
     diffusion_model.input_channel_mult = None
     diffusion_model.conv_resample = True
     diffusion_model.dims = 2
@@ -77,12 +77,12 @@ def get_config():
     # Encoder settings
     config.model.encoder = encoder = ml_collections.ConfigDict()
     encoder.network = 'BeatGANsEncoderModel'
-    encoder.model_channels = 64
+    encoder.model_channels = 128
     encoder.enc_num_res_blocks = 2
     encoder.latent_dim = data.latent_dim
     encoder.enc_attn_resolutions = ()
     encoder.enc_use_time_condition = True
-    encoder.enc_channel_mult = (1, 1, 2, 4)
+    encoder.enc_channel_mult = (1, 1, 2, 3, 4, 4)
     encoder.enc_pool = 'flatten-linear'
     encoder.resolution_before_flattening = data.image_size // 2**(len(encoder.enc_channel_mult)-1)
     encoder.resblock_updown = False
