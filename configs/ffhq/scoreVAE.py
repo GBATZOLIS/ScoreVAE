@@ -24,16 +24,20 @@ def get_config():
     training.vis_frequency = 20 #generate data every vis_frequency epochs
     training.fid_eval_frequency = 2000 #FID evaluation frequency
     training.steps = 128 #number of integration steps
-    training.num_samples = 128 #number of samples to generate
+    training.num_samples = 12 #number of samples to generate
     ## settings for forward SDE + loss function
     training.sde = 'vpsde'
-    training.loss = "scoreVAE_loss" #ScoreVAE setting
+    # training.loss = "scoreVAE_loss" #ScoreVAE setting
+    training.loss = "scoreVAE_guided" #ScoreVAE setting
     training.likelihood_weighting = False
-    training.kl_weight = 1e-3 #ScoreVAE setting
+    training.kl_weight = 1e-5 #ScoreVAE setting
+    training.guidance_interval = (0.28, 2.9) #ScoreVAE setting
+    # training.guidance_interval = (0.0822161, 0.469663) #ScoreVAE setting This is time not sigma
+    training.guidance_weight = 2.1 #ScoreVAE setting
 
     # Data settings
     config.data = data = ml_collections.ConfigDict()
-    data.batch_size = 24
+    data.batch_size = 12
     data.dataset = 'FFHQ'
     data.image_size = 128
     data.num_channels = 3
@@ -43,7 +47,8 @@ def get_config():
     # Model settings
     config.model = model = ml_collections.ConfigDict()
     model.ema_decay = 0.9999
-    model.network = 'CombinedDiffusionEncoder'
+    # model.network = 'CombinedDiffusionEncoder'
+    model.network = 'GuidedCombinedDiffusionEncoder'
 
     # Pretrained Diffusion Model settings
     config.model.diffusion_model = diffusion_model = ml_collections.ConfigDict()

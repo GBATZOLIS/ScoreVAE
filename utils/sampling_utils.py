@@ -16,9 +16,12 @@ import os
 import matplotlib
 matplotlib.use('Agg')
 
-def get_score_fn(sde, diffusion_model, train=False):
-    return diffusion_model.get_score_fn(sde, train)
-
+def get_score_fn(sde, diffusion_model, train=False, G=None, guidance_interval = None):
+    if G is not None and guidance_interval is not None:
+        return diffusion_model.get_score_fn(sde, train, G=G, guidance_interval=guidance_interval)
+    else:
+        return diffusion_model.get_noise_predictor_fn(sde, train)
+    
 def get_inverse_step_fn(discretisation):
     # Discretisation sequence is ordered from biggest time to smallest time
     map_t_to_negative_dt = {}
@@ -141,10 +144,10 @@ def evaluation_mode(model):
         if was_training:
             model.train()
 
-def generate_samples(y, sde, diffusion_model, steps, shape, device):
+def generate_samples(y, sde, diffusion_model, steps, shape, device, G=None, guidance_interval = None):
     diffusion_model.to(device)  # Ensure the model is on the correct device
     with evaluation_mode(diffusion_model):
-        score_fn = get_score_fn(sde, diffusion_model, train=False)
+        score_fn = get_score_fn(sde, diffusion_model, train=False, G=G, guidance_interval = guidance_interval)
         with torch.no_grad():
             x_mean = Algorithm1(sde, steps, score_fn, shape, device, y)
 
@@ -205,7 +208,7 @@ def plot_and_save_histogram_of_norms(samples, writer, steps):
     # Save the histogram plot to TensorBoard
     save_plot_to_tensorboard(writer, fig, 'Histogram of Norms', steps)
 
-def get_generation_callback(vis_callback):
+def get_generation_callback(vis_callback, G=None, guidance_interval = None):
     if vis_callback == 'base':
         def generation_callback(batch, writer, sde, diffusion_model, steps, shape, device, epoch):
             #Unconditional diffusion models
@@ -239,7 +242,7 @@ def get_generation_callback(vis_callback):
             x, y = batch
             z = diffusion_model.encode(x)  # Get the latent representation
             cond = [y, z]
-            reconstruction = generate_samples(cond, sde, diffusion_model, steps, shape, device)
+            reconstruction = generate_samples(cond, sde, diffusion_model, steps, shape, device, G=G, guidance_interval=guidance_interval)
             
             # Visualize reconstructions
             num_rows = int(math.sqrt(reconstruction.shape[0]))

@@ -179,12 +179,18 @@ def resume_training(config, model, ema_model, load_model_func, get_optimizer_and
         return 0, 0, [], float('inf'), 0, optimizer, scheduler
     
 
-def get_noise_fn(sde, diffusion_model, train=True):
-    return diffusion_model.get_noise_predictor_fn(sde, train)
+def get_noise_fn(sde, diffusion_model, train=True, G=1.0, guidance_interval = None):
+    if G is not None and guidance_interval is not None:
+        return diffusion_model.get_noise_predictor_fn(sde, train, G, guidance_interval)
+    else:
+        return diffusion_model.get_noise_predictor_fn(sde, train)
 
-def get_score_fn(sde, diffusion_model, train=True):
-    return diffusion_model.get_score_fn(sde, train)
-
+def get_score_fn(sde, diffusion_model, train=True, G=1.0, guidance_interval = None):
+    if G is not None and guidance_interval is not None:
+        return diffusion_model.get_score_fn(sde, train, G, guidance_interval)
+    else:
+        return diffusion_model.get_score_fn(sde, train)
+        
 def eval_callback(score_fn, sde, val_dataloader, num_datapoints, device, save_path, name=None, return_svd=False):
     os.makedirs(save_path, exist_ok=True)
 

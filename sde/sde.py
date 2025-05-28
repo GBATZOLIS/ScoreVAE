@@ -186,6 +186,11 @@ class VPSDE(SDE):
   def T(self):
     return 1
 
+  def t_from_sigma(self, sigma):
+     beta_d = self.beta_1 - self.beta_0
+     ratio = self.beta_0/beta_d
+     return torch.sqrt(ratio**2 + 2*torch.log(torch.tensor(sigma)**2 + 1)/beta_d) - ratio
+
   def edm_coefficients(self, t):
      beta_d = self.beta_1 - self.beta_0
      edm_s_t = torch.exp(-0.25 * beta_d * t ** 2 - 0.5 * t * self.beta_0)

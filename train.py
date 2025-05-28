@@ -41,7 +41,11 @@ def train(config):
 
     t_dist = Uniform(sde.sampling_eps, 1)
     loss_fn = get_loss_fn(config, sde, t_dist)
-    generation_callback = get_generation_callback(config.training.vis_callback)
+    generation_callback = get_generation_callback(
+        config.training.vis_callback, 
+        G=config.training.guidance_weight, 
+        guidance_interval=config.training.guidance_interval
+        )
 
     for epoch in range(epoch, config.training.epochs):
         model.train()
