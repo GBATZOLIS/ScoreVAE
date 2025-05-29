@@ -20,7 +20,7 @@ def get_score_fn(sde, diffusion_model, train=False, G=None, guidance_interval = 
     if G is not None and guidance_interval is not None:
         return diffusion_model.get_score_fn(sde, train, G=G, guidance_interval=guidance_interval)
     else:
-        return diffusion_model.get_noise_predictor_fn(sde, train)
+        return diffusion_model.get_score_fn(sde, train)
     
 def get_inverse_step_fn(discretisation):
     # Discretisation sequence is ordered from biggest time to smallest time
@@ -214,7 +214,7 @@ def get_generation_callback(vis_callback, G=None, guidance_interval = None):
             #Unconditional diffusion models
             _, y = batch
             #y is the condition. 
-            samples = generate_samples(y, sde, diffusion_model, steps, shape, device)
+            samples = generate_samples(y, sde, diffusion_model, steps, shape, device, G=G, guidance_interval=guidance_interval)
             
             if len(samples.shape[1:]) == 1: #euclidean data, i.e. shape=(batchsize, ambient_dim)
                 if samples.shape[1] in [2, 3]:
@@ -253,9 +253,6 @@ def get_generation_callback(vis_callback, G=None, guidance_interval = None):
             grid_original = vutils.make_grid(x, nrow=num_rows, normalize=True, scale_each=True)
             writer.add_image(f'Original', grid_original, epoch)
     
-    return generation_callback
-
-        
     return generation_callback
 
 
@@ -527,3 +524,4 @@ def inspect_timesteps(sde, num_steps, eval_dir):
     plot_path = os.path.join(eval_dir, 'diffusion_times_and_snr_plot.png')
     plt.savefig(plot_path)
     plt.close()
+    

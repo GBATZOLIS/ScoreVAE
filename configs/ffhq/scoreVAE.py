@@ -37,7 +37,7 @@ def get_config():
 
     # Data settings
     config.data = data = ml_collections.ConfigDict()
-    data.batch_size = 12
+    data.batch_size = 30
     data.dataset = 'FFHQ'
     data.image_size = 128
     data.num_channels = 3
