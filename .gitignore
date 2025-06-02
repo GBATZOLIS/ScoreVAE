@@ -1,3 +1,5 @@
 *.pyc
 results/
 datasets/
+*.png
+*.json

@@ -111,7 +111,7 @@ class GuidedCombinedDiffusionEncoder(nn.Module):
                 # Lerp only for samples in guidance interval, otherwise add
                 out = torch.where(
                     mask.view(-1, *([1] * (pretrained_noise_prediction.ndim - 1))),  # reshape mask for broadcasting
-                    pretrained_noise_prediction.lerp(latent_correction_noise, G),
+                    pretrained_noise_prediction.lerp(pretrained_noise_prediction + latent_correction_noise, G),
                     pretrained_noise_prediction + latent_correction_noise
                 )
                 return out
@@ -150,16 +150,19 @@ class GuidedCombinedDiffusionEncoder(nn.Module):
 
             if (guidance_interval is not None) and (t is not None) and (not train):
                 sigma_start, sigma_stop = guidance_interval
+                # print(f"weight: {G}, int: {sigma_start} - {sigma_stop}")
                 t_start = sde.t_from_sigma(sigma_start)
                 t_stop = sde.t_from_sigma(sigma_stop)
+                # print(f't_start: {t_start}')
+                # print(f't_stop: {t_stop}')
                 mask = (t >= t_start) & (t <= t_stop)  # shape: [batch_size]
 
                 # Lerp only for samples in guidance interval, otherwise add
-                out = torch.where(
-                    mask.view(-1, *([1] * (pretrained_score.ndim - 1))),  # reshape mask for broadcasting
-                    pretrained_score.lerp(latent_score, G),
-                    pretrained_score + latent_score
-                )
+                if (t[0].item() <= t_stop) and (t[0].item() >= t_start):
+                    # print(t[0].item())
+                    out = pretrained_score + G*latent_score
+                else:
+                    out = pretrained_score + latent_score
                 return out
             else:
                 return pretrained_score + latent_score
