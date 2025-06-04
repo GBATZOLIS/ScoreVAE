@@ -1,5 +1,9 @@
 *.pyc
+*.out
+*.err
+*.sh
+*.ipynb
+
 results/
 datasets/
-*.png
-*.json
+**/wandb/

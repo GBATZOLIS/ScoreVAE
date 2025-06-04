@@ -3,12 +3,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 import argparse
 import pickle
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch.utils.data import DataLoader, DistributedSampler
 
 from data.data_utils import get_dataloaders
 from models import get_model
@@ -19,6 +19,7 @@ from utils.optim_utils import get_optimizer_and_scheduler
 from torch.distributions import Uniform
 from loss import get_loss_fn
 from configs import load_config
+from evaluation.fid import fid_evaluation_callback
 
 def save_config(config):
     config_dir = os.path.join(config.base_log_dir, config.experiment)
@@ -167,6 +168,7 @@ def main():
     config = load_config(args.config)
     save_config(config)
     world_size = min(config.training.gpus, torch.cuda.device_count())
+
     if 'SLURM_PROCID' in os.environ:
         rank = int(os.environ['SLURM_PROCID'])
         train_ddp(rank, world_size, config)
@@ -175,3 +177,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
