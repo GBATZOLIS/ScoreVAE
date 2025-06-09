@@ -176,16 +176,14 @@ def plot_samples(samples):
 def save_plot_to_tensorboard(writer, fig, tag, global_step):
     """Save the plot to TensorBoard."""
     fig.canvas.draw()
-    
-    # Convert plot to numpy array
-    img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    
-    # Add the image to TensorBoard
+    renderer = fig.canvas.get_renderer()
+    img = np.frombuffer(renderer.buffer_rgba(), dtype=np.uint8)
+    img = img.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+    img = img[:, :, :3]  # Convert RGBA to RGB
+
     writer.add_image(tag, img, global_step=global_step, dataformats='HWC')
-    
-    # Close the plot
     plt.close(fig)
+
 
 def plot_and_save_histogram_of_norms(samples, writer, steps):
     # Calculate the norms of each sample

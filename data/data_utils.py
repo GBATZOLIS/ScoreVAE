@@ -10,7 +10,7 @@ def get_dataloaders(args, seed=42):
     generator = torch.Generator().manual_seed(seed)
 
     if dataset_name == 'sphere':
-        dataset = KSphereDataset(args)
+        dataset = KSphereDataset(args, seed=seed)
         
         train_size = int(0.9 * len(dataset))
         val_size = int(0.1 * len(dataset))

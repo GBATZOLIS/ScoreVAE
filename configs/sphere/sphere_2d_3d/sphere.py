@@ -2,17 +2,11 @@ import ml_collections
 
 def get_config():
     config = ml_collections.ConfigDict()
-
-    # Logging settings
-    config.base_log_dir = "./results"
-    config.experiment = "check_deep_sphere"
-    config.tensorboard_dir = f"{config.base_log_dir}/{config.experiment}/training_logs"
-    config.checkpoint_dir = f"{config.base_log_dir}/{config.experiment}/checkpoints"
-    config.eval_dir = f"{config.base_log_dir}/{config.experiment}/eval"
+    config.random_seed = 42
 
     # Training settings
     config.training = training = ml_collections.ConfigDict()
-    training.device = "cpu"  # change to "cuda" if available
+    training.device = "cuda:0"  # change to "cuda" if available
     training.gpus = 1  # Number of GPUs to use
     training.epochs = 1000
     training.checkpoint_frequency = 20
@@ -31,12 +25,12 @@ def get_config():
 
     # Data settings
     config.data = data = ml_collections.ConfigDict()
-    data.batch_size = 64
+    data.batch_size = 128
     data.dataset = 'sphere'
-    data.data_samples = 10000
+    data.data_samples = 20000
     data.n_spheres = 1
-    data.ambient_dim = 2         # ambient dimension: 2 for a 1d sphere in 2D
-    data.manifold_dim = 1
+    data.ambient_dim = 3
+    data.manifold_dim = 2
     data.noise_std = 0.0
     data.embedding_type = 'random_isometry'
     data.radii = []
@@ -46,7 +40,7 @@ def get_config():
     # Model settings
     config.model = model = ml_collections.ConfigDict()
     model.network = 'mlp'
-    model.checkpoint = 'Model_epoch_139_loss_0.153'
+    model.checkpoint = 'Model_epoch_139_loss_0.148.pth'
     model.state_size = data.ambient_dim  # same as ambient_dim
     model.hidden_dim = 512
     model.depth = 3
@@ -69,5 +63,12 @@ def get_config():
     evaluation.eval_callback_epochs = 20
     evaluation.num_eval_points = 10
     evaluation.eval_save_path = "./eval"
+
+    # Logging settings
+    config.base_log_dir = "./results"
+    config.experiment = f"sphere_{config.data.manifold_dim}d_{config.data.ambient_dim}d"
+    config.tensorboard_dir = f"{config.base_log_dir}/{config.experiment}/training_logs"
+    config.checkpoint_dir = f"{config.base_log_dir}/{config.experiment}/checkpoints"
+    config.eval_dir = f"{config.base_log_dir}/{config.experiment}/eval"
 
     return config

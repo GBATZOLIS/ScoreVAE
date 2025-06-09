@@ -17,13 +17,22 @@ from torch.distributions import Uniform
 from loss import get_loss_fn
 from configs import load_config
 from evaluation.fid import fid_evaluation_callback
+import numpy as np
+import random
+
+def set_global_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 def train(config):
     tensorboard_dir, checkpoint_dir, eval_dir = prepare_training_dirs(config)
     writer = SummaryWriter(log_dir=tensorboard_dir)
     device = torch.device(config.training.device)
 
-    train_loader, val_loader, test_loader = get_dataloaders(config.data)
+    train_loader, val_loader, test_loader = get_dataloaders(config.data, config.random_seed)
     
     # Create the model
     model = get_model(config.model)
@@ -121,6 +130,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     config = load_config(args.config)
+
+    # Set global seed for full reproducibility
+    set_global_seed(config.random_seed)
 
     # Save configuration to a file
     config_dir = os.path.join(config.base_log_dir, config.experiment)

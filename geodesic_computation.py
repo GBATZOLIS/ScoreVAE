@@ -21,6 +21,8 @@ import numpy as np
 import pickle
 import torch
 import torch.multiprocessing as mp
+from torch.nn.functional import mse_loss
+from torch.utils.data import Subset
 from argparse import ArgumentParser
 from typing import Tuple, Dict, Any
 
@@ -198,9 +200,60 @@ def geodesic_batch(diff_cfg, geo_cfg):
         "└───────────────────────────────────────────────────────────────────────┘"
     ))
 
+    # 6. Ground truth geodesic computation (if available)
+    if isinstance(dataset, Subset):
+        base_dataset = dataset.dataset
+    else:
+        base_dataset = dataset
+
+    if hasattr(base_dataset, "compute_geodesic"):
+        print("[Geodesic‑Batch] Ground truth geodesics available in dataset. Computing...")
+
+        t_vals = torch.linspace(0, 1, geo_cfg.get("n_segments", 16) + 1).to(device)
+
+        with torch.no_grad():
+            gt_paths = base_dataset.compute_geodesic(p_flat.to('cpu'), q_flat.to('cpu'), t_vals)
+            gt_paths = gt_paths.cpu()  # shape: [B, T, D]
+
+        # Reshape predicted geodesics: list of [B, D] → [B, T, D]
+        path_tensor = torch.stack(path, dim=0).permute(1, 0, 2).cpu()
+
+        # Compute MSE for each sample
+        errors = []
+        for i in range(num_pairs):
+            err = mse_loss(path_tensor[i], gt_paths[i])
+            errors.append(err.item())
+
+        errors = np.array(errors)
+        print("[Geodesic‑Batch] Geodesic error statistics over batch:")
+        print(f"    Mean       : {errors.mean():.4e}")
+        print(f"    Std        : {errors.std():.4e}")
+        print(f"    Min        : {errors.min():.4e}")
+        print(f"    Max        : {errors.max():.4e}")
+
+        # Optional: visualize both predicted and GT geodesics
+        '''
+        visualize_riemannian_optimization_selector(
+            bg_flat.cpu(),
+            lambda x: score_fn(x.to(device)).cpu(),
+            t_pert.item(),
+            trajectories=[p.cpu() for p in path_tensor],
+            metrics={"gt_geodesics": gt_paths},
+            min_point=None,
+            orig_shape=orig_shape,
+            log_dir=eval_dir,
+            plot_filename=geo_cfg.get("plot_filename", "geodesics_vs_gt.png"),
+        )
+        '''
+    else:
+        print("[Geodesic‑Batch] No GT geodesic method in dataset.")
+
+
+
+
     # 7. Visualisation background -------------------------------------------
     with torch.no_grad():
-        bg_cap = min(1000, len(dataset))
+        bg_cap = min(2000, len(dataset))
         bg = torch.stack([
             dataset[i][0] if isinstance(dataset[i], tuple) else dataset[i]
             for i in range(bg_cap)
