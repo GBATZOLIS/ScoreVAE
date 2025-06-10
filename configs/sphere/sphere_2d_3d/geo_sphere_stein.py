@@ -27,22 +27,19 @@ CONFIG = {
     # ---------------------------------------------------------------------
     # Forward‑noise level t  (0 < t ≤ 1).  Pick the smallest t such that
     # optimisation is numerically stable (SNR ≳ 5 dB).
-    "time_for_perturbation": 0.04, # 0.2 is typical for SD‑2.1 latents
+    "time_for_perturbation": 0.03, # 0.2 is typical for SD‑2.1 latents
 
     # ---------------------------------------------------------------------
     # Metric
     # ---------------------------------------------------------------------
-    #stein,lam_metric->1
-    #jacobian,lam_metric->0.05
-    "metric_type": "jacobian",       # {"stein", "jacobian"}
-    "lam_metric":   0.05,          # λ in  g = I + λ ssᵀ  or  JᵀJ + λI
-    #stein,lam_metric->1
-    #jacobian,lam_metric->0.01-0.1
+    "metric_type": "stein",       # {"stein", "jacobian"}
+    "lam_metric":   2.,          # λ in  g = I + λ ssᵀ  or  JᵀJ + λI
+
     # ---------------------------------------------------------------------
     # Geodesic algorithm (Algorithm‑2)
     # ---------------------------------------------------------------------
     "n_segments": 15,             # resolution of the discretised path
-    "lam_smooth": 100.,           # curvature penalty
+    "lam_smooth": 200.,           # curvature penalty
     "lam_mono":   2.,            # "monotonic progress" penalty (set >0 if
                                    # path tends to double back)
 
@@ -52,9 +49,9 @@ CONFIG = {
     "adam_lr":   1e-2,            # learning‑rate α
     "betas":     (0.9, 0.999),    # momentum coefficients β₁, β₂
     "eps":       1e-8,            # numerical stability ε
-    "max_iters": 1000,             # optimisation budget
+    "max_iters": 2500,             # optimisation budget
     "tol":       1e-6,            # stop when max‖∇_Riem‖ < tol
-    "patience": 40,  # stop if no improvement in last 20 steps
+    "patience": 50,                # stop if no improvement in last 40 steps
 
     # ---------------------------------------------------------------------
     # Conjugate‑Gradient (Jacobian metric only)
@@ -67,5 +64,5 @@ CONFIG = {
     # ---------------------------------------------------------------------
     # Output / logging
     # ---------------------------------------------------------------------
-    "plot_filename": "geodesics.png",
+    "plot_filename": "geodesics_stein.png",
 }
