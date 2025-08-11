@@ -91,12 +91,11 @@ def worker(
                 "best_iter": loss_info.get('iter', -1),
             }
 
-            # --- ADDED: Unpack betas tuple into separate columns for easier analysis ---
+            # Unpack betas tuple into separate columns for easier analysis
             if 'betas' in full_results:
                 beta1, beta2 = full_results.pop('betas')
                 full_results['beta1'] = beta1
                 full_results['beta2'] = beta2
-            # --- End of Change ---
 
             results_list.append(full_results)
             
@@ -121,32 +120,52 @@ def main():
 
     # --- 1. Define Parameter Grid ---
     param_grid = []
-    
-    common_params = {
-        "lam_smooth": [50., 200],
+
+    # Parameters that are the same across all experiments
+    base_params = {
+        "lam_smooth": [200.],
         "lam_mono": [2.0],
-        "adam_lr": [5e-3, 1e-2],
-        "time_for_perturbation": [0.03],
+        "time_schedule": [[0.05, 0.04, 0.03], [0.03]],
         "patience": [50],
-        "betas": [(0.9, 0.999), (0.8, 0.990)],
+        "betas": [(0.8, 0.990)],
     }
-    
+
+    # Parameters specific to each metric type
     metric_configs = {
-        "stein": {"lam_metric": [2.0]},
+        #"stein": {"lam_metric": [1.]},
         "jacobian": {"lam_metric": [0.05]}
     }
-    
-    common_grid_keys = list(common_params.keys())
-    common_grid_vals = list(product(*common_params.values()))
 
+    # --- MODIFIED: Define separate configs for each line search method ---
+    line_search_configs = [
+        # Configs for 'fixed' learning rate
+        #{
+        #    "line_search": ["fixed"],
+        #    "adam_lr": [5e-3, 1e-2],
+        #},
+        # Configs for 'armijo' line search
+        {
+            "line_search": ["armijo"],
+            "adam_lr":      [1e-2],       # Initial step size guess
+            "armijo_rho":   [1e-4, 1e-3, 1e-2, 5e-2],     # Sufficient decrease parameter
+            "armijo_beta":  [0.3, 0.5, 0.8],            # Backtracking factor
+            "armijo_max_iter": [15],
+        }
+    ]
+
+    # --- Build the grid without redundant configurations ---
     for metric_type, specific_params in metric_configs.items():
-        specific_keys = list(specific_params.keys())
-        specific_vals = list(product(*specific_params.values()))
-        for s_vals in specific_vals:
-            cfg = {"metric_type": metric_type, **dict(zip(specific_keys, s_vals))}
-            for c_vals in common_grid_vals:
-                full_cfg = {**cfg, **dict(zip(common_grid_keys, c_vals))}
-                param_grid.append(full_cfg)
+        for ls_config in line_search_configs:
+            # Combine base, metric-specific, and line-search-specific params
+            current_run_params = {**base_params, **specific_params, **ls_config}
+            
+            # Get the keys and the product of values for the current group
+            keys = list(current_run_params.keys())
+            vals = list(product(*current_run_params.values()))
+            
+            for v in vals:
+                cfg = {"metric_type": metric_type, **dict(zip(keys, v))}
+                param_grid.append(cfg)
 
     random.shuffle(param_grid)
     print(f"Generated {len(param_grid)} unique parameter configurations for the sweep.")
@@ -186,13 +205,17 @@ def main():
 
         df = pd.DataFrame(final_results)
         
-        # --- MODIFIED: Added beta1 and beta2 to the list of columns to display ---
+        # Define columns for display, including new ones if they don't exist
         first_cols = [
-            'mean_error', 'geodesic_energy', 'metric_type', 'lam_metric', 
-            'lam_smooth', 'lam_mono', 'adam_lr', 'time_for_perturbation',
-            'beta1', 'beta2'
+            'mean_error', 'geodesic_energy', 'metric_type', 'line_search', 'adam_lr', 
+            'lam_metric', 'lam_smooth', 'lam_mono', 'time_schedule',
+            'beta1', 'beta2', 'armijo_rho', 'armijo_beta', 'armijo_max_iter'
         ]
-        # --- End of Change ---
+        
+        # Ensure all columns in first_cols exist in the DataFrame, adding them with NaN if not
+        for col in first_cols:
+            if col not in df.columns:
+                df[col] = np.nan
 
         other_cols = [col for col in df.columns if col not in first_cols]
         df = df[first_cols + other_cols]
@@ -207,11 +230,20 @@ def main():
         pd.set_option('display.max_columns', None)
         pd.set_option('display.width', 200)
 
+        # Columns to display in the summary tables
+        display_cols = [
+            'mean_error', 'geodesic_energy', 'metric_type', 'line_search', 'adam_lr',
+            'lam_metric', 'lam_smooth', 'beta1', 'armijo_rho'
+        ]
+        # Filter display_cols to only those present in the dataframe
+        display_cols_exist = [col for col in display_cols if col in df.columns]
+
+
         print("\n--- Best Configs by Mean Error vs. GT (lower is better) ---")
-        print(df.nsmallest(10, 'mean_error')[first_cols])
+        print(df.nsmallest(10, 'mean_error')[display_cols_exist])
 
         print("\n--- Best Configs by Geodesic Energy (lower is better) ---")
-        print(df.nsmallest(10, 'geodesic_energy')[first_cols])
+        print(df.nsmallest(10, 'geodesic_energy')[display_cols_exist])
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)

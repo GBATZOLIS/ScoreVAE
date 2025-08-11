@@ -27,7 +27,7 @@ CONFIG = {
     # ---------------------------------------------------------------------
     # Forward‑noise level t  (0 < t ≤ 1).  Pick the smallest t such that
     # optimisation is numerically stable (SNR ≳ 5 dB).
-    "time_for_perturbation": 0.03, # 0.2 is typical for SD‑2.1 latents
+    "time_schedule": [0.06, 0.05, 0.04, 0.03], 
 
     # ---------------------------------------------------------------------
     # Metric
@@ -49,12 +49,18 @@ CONFIG = {
     # ---------------------------------------------------------------------
     # Riemannian‑Adam optimiser (Algorithm‑1)
     # ---------------------------------------------------------------------
-    "adam_lr":   5e-3, #0.005,            # learning‑rate α
+    "adam_lr":   1e-2, #0.005,            # learning‑rate α
     "betas":     (0.8, 0.990),    # momentum coefficients β₁, β₂
     "eps":       1e-8,            # numerical stability ε
-    "max_iters": 2500,             # optimisation budget
+    "max_iters": 2000,             # optimisation budget
     "tol":       1e-6,            # stop when max‖∇_Riem‖ < tol
     "patience": 50,                # stop if no improvement in last 40 steps
+    "line_search": 'armijo',        # line search type. Choices are: {'fixed', 'armijo', 'none'}.
+    "armijo_rho": 0.01,
+    "armijo_beta": 0.7,
+    "armijo_max_iter": 15,
+    "transport_mode": "ad_hoc",  # vector transport mode. Choices are: {'ad_hoc', 'retraction', 'rk2', 'first_order'}.
+    "transport_steps": 1,  # number of integration steps for transport
 
     # ---------------------------------------------------------------------
     # Conjugate‑Gradient (Jacobian metric only)

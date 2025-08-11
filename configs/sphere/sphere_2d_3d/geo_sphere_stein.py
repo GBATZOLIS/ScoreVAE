@@ -27,13 +27,13 @@ CONFIG = {
     # ---------------------------------------------------------------------
     # Forward‑noise level t  (0 < t ≤ 1).  Pick the smallest t such that
     # optimisation is numerically stable (SNR ≳ 5 dB).
-    "time_for_perturbation": 0.03, # 0.2 is typical for SD‑2.1 latents
+    "time_schedule": [0.06, 0.05, 0.04, 0.03], #[0.04], #[0.06, 0.05, 0.04, 0.03], # 0.2 is typical for SD‑2.1 latents
 
     # ---------------------------------------------------------------------
     # Metric
     # ---------------------------------------------------------------------
     "metric_type": "stein",       # {"stein", "jacobian"}
-    "lam_metric":   2.,          # λ in  g = I + λ ssᵀ  or  JᵀJ + λI
+    "lam_metric":   1.,          # λ in  g = I + λ ssᵀ  or  JᵀJ + λI
 
     # ---------------------------------------------------------------------
     # Geodesic algorithm (Algorithm‑2)
@@ -49,9 +49,15 @@ CONFIG = {
     "adam_lr":   1e-2,            # learning‑rate α
     "betas":     (0.9, 0.999),    # momentum coefficients β₁, β₂
     "eps":       1e-8,            # numerical stability ε
-    "max_iters": 2500,             # optimisation budget
+    "max_iters": 2000,             # optimisation budget
     "tol":       1e-6,            # stop when max‖∇_Riem‖ < tol
     "patience": 50,                # stop if no improvement in last 40 steps
+    "line_search": 'armijo',        # line search type. Choices are: {'fixed', 'armijo', 'none'}.
+    "armijo_rho": 0.05,
+    "armijo_beta": 0.7,
+    "armijo_max_iter": 15,
+    "transport_mode": "ad_hoc",  # vector transport mode. Choices are: {'ad_hoc', 'retraction', 'rk2', 'first_order'}.
+    "transport_steps": 1,  # number of integration steps for transport
 
     # ---------------------------------------------------------------------
     # Conjugate‑Gradient (Jacobian metric only)
