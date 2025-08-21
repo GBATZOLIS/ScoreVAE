@@ -1,14 +1,14 @@
 # -------------------------------------------------------------------------
-# FAST single‑GPU trainer for ScoreVAE / DDPM – feature‑parity with train.py
+# FAST single-GPU trainer for ScoreVAE / DDPM – feature-parity with train.py
 # -------------------------------------------------------------------------
-# This version disables CUDA Graph capture inside Torch‑Inductor to avoid
+# This version disables CUDA Graph capture inside Torch-Inductor to avoid
 # the "assert data_ptr == new_inputs[idx].data_ptr()" crash that appears
 # with dynamic batch sizes or mixed autocast contexts.
 # -------------------------------------------------------------------------
 from __future__ import annotations
 
 # ──────────────────────────────────────────────────────────────────────────
-# Disable CUDA graphs *properly* for Torch‑Inductor (must be done before
+# Disable CUDA graphs *properly* for Torch-Inductor (must be done before
 # the first torch.compile call and ideally before importing anything that
 # triggers Inductor setup).
 # -------------------------------------------------------------------------
@@ -21,14 +21,17 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 from torch.distributions import Uniform
 from tqdm import tqdm
 
-# Official switch – works for PyTorch >= 2.1
+# Official switch – works for PyTorch >= 2.1
 from torch._inductor import config as inductor_cfg
 inductor_cfg.triton.cudagraphs = False  # ⇐ THIS actually blocks CUDAGraphs
-# (The env‑var TORCHINDUCTOR_DISABLE_CUDAGRAPHS you tried earlier is ignored.)
+
+# Use safe worker start method globally (pre-DataLoader)
+mp.set_start_method("spawn", force=True)
 
 # ──────────────────────────────────────────────────────────────────────────
 # project imports
@@ -62,30 +65,26 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def compile_model(model: nn.Module) -> nn.Module:
-    """Return a torch.compile‑d model **without** CUDA graphs.
-
-    • On PyTorch ≥ 2.6 the preset "max-autotune-no-cudagraphs" is available.
-    • For slightly older 2.x releases we just fall back to "max-autotune" –
-      the global flag we set above already prevents graph capture.
-    """
+def compile_model(model: nn.Module, do_compile: bool = True) -> nn.Module:
+    """Return a torch.compile-d model **without** CUDA graphs."""
+    if not do_compile:
+        return model
     try:
         return torch.compile(model, mode="max-autotune-no-cudagraphs")
     except (TypeError, ValueError):
-        # Fallback for Torch versions that don't know the newer preset.
         return torch.compile(model, mode="max-autotune")
 
 # ---------------------------------------------------------------------- train loop
 
 def train(cfg):
-    # ---------------- configuration‑dependent dirs & writer ----------------
+    # ---------------- configuration-dependent dirs & writer ----------------
     tb_dir, ckpt_dir, _ = prepare_training_dirs(cfg)
     writer = SummaryWriter(log_dir=tb_dir)
 
     # ---------------- hardware knobs ----------------
     device = torch.device(cfg.training.device)
-    torch.backends.cudnn.benchmark = True  # heuristic autotune convs
-    torch.set_float32_matmul_precision("high")  # enable TF32 on A100/RTX 30xx
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")  # TF32 where available
 
     # ---------------- data ----------------
     train_loader, val_loader, test_loader = get_dataloaders(cfg.data, seed=cfg.random_seed)
@@ -93,12 +92,13 @@ def train(cfg):
     # ---------------- model ----------------
     base_model = get_model(cfg.model).to(device, memory_format=torch.channels_last)
     base_model.print_model_summary()
-    model = compile_model(base_model)  # compiled model is still nn.Module
+    do_compile = bool(getattr(cfg.model, "compile", True))
+    model = compile_model(base_model, do_compile=do_compile)  # compiled model is still nn.Module
 
     # ---------------- diffusion process / SDE ----------------
     sde = configure_sde(cfg)
 
-    # ---------------- log‑space EMA ----------------
+    # ---------------- log-space EMA ----------------
     ema = EMA(model, decay=cfg.model.ema_decay)
 
     # ---------------- optimiser & LR schedule ----------------
@@ -115,7 +115,7 @@ def train(cfg):
         scheduler,
     ) = resume_training(cfg, model, ema, load_model, get_optimizer_and_scheduler)
 
-    # ---------------- loss fn ----------------
+    # ---------------- loss fn ----------------
     t_dist = Uniform(sde.sampling_eps, 1.0)
     loss_fn = get_loss_fn(cfg, sde, t_dist)
 
@@ -125,10 +125,10 @@ def train(cfg):
     # ---------------- AMP settings ----------------
     use_bf16 = torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_dtype is torch.float16)
+    scaler = torch.cuda.amp.GradScaler(enabled=(amp_dtype is torch.float16))
 
     # ====================================================================
-    #                           EPOCH LOOP
+    #                           EPOCH LOOP
     # ====================================================================
     for epoch in range(start_epoch, cfg.training.epochs):
         # ================================================= train phase ===
@@ -142,7 +142,7 @@ def train(cfg):
             batch = prepare_batch(data, device)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(dtype=amp_dtype):
+            with torch.amp.autocast("cuda", dtype=amp_dtype):
                 loss = loss_fn(model, batch, train=True)
 
             scaler.scale(loss).backward()
@@ -165,7 +165,7 @@ def train(cfg):
         ema.apply_shadow()  # swap to EMA params
         model.eval()
         val_total = 0.0
-        with torch.no_grad(), torch.cuda.amp.autocast(dtype=amp_dtype):
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype):
             for data in val_loader:
                 val_total += loss_fn(model, prepare_batch(data, device), train=False).item()
         ema.restore()  # swap back
@@ -175,25 +175,33 @@ def train(cfg):
 
         # ---------------- visualisation callback ----------------
         if (epoch + 1) % cfg.training.vis_frequency == 0:
+            # Make sure all kernels are finished before sampling (avoids worker races)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
             shape = (cfg.training.num_samples, *cfg.data.shape)
+            # take one small batch for any conditioning y, then generate
             batch = prepare_batch(next(iter(val_loader)), device)
-            gen_cb(batch, writer, sde, model, cfg.training.steps, shape, device, epoch)
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype):
+                gen_cb(batch, writer, sde, model, cfg.training.steps, shape, device, epoch)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
 
         # ---------------- FID evaluation ----------------
         if (epoch + 1) % cfg.training.fid_eval_frequency == 0:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
             shape = (cfg.training.num_samples, *cfg.data.shape)
             steps = cfg.training.steps
-
-            # FID on (train+val)
             fid_evaluation_callback(
                 writer, sde, model, steps, shape, device, epoch,
                 dataloaders=[train_loader, val_loader], train=True,
             )
-            # FID on test
             fid_evaluation_callback(
                 writer, sde, model, steps, shape, device, epoch,
                 dataloaders=[test_loader], train=False,
             )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
 
         # ---------------- early stopping / bookkeeping ----------------
         improved = val_loss < best_val_loss
@@ -215,9 +223,9 @@ def train(cfg):
     writer.close()
     if torch.cuda.is_available():
         peak = torch.cuda.max_memory_allocated(device) / 1024 ** 3
-        print(f"Training complete. Peak GPU RAM: {peak:.2f} GiB")
+        print(f"Training complete. Peak GPU RAM: {peak:.2f} GiB")
 
-# ---------------------------------------------------------------------- entry‑point
+# ---------------------------------------------------------------------- entry-point
 
 def main():
     parser = argparse.ArgumentParser(

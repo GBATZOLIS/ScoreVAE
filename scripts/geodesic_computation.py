@@ -15,7 +15,7 @@ from torch.utils.data import Subset, Dataset
 from tqdm import tqdm
 
 # ─── Project-local Imports ───────────────────────────────────────────
-from data.data_utils         import get_dataloaders
+from data.data_utils import get_dataloaders
 from models                  import get_model
 from sde                     import configure_sde
 from utils.train_utils       import prepare_training_dirs, EMA, load_model
@@ -32,6 +32,8 @@ from debug_initialization import (
     get_score_fn,
     save_path_grid,
     generate_ode_initialized_path,
+    make_ddim_post_denoiser,
+    make_sharded_ddim_post_denoiser
 )
 
 # ─── Misc Helpers ────────────────────────────────────────────────────
@@ -176,30 +178,104 @@ def run_geodesic_computation(
             if i == 0:
                 initial_path_to_visualize = [t.detach().clone() for t in init_path_opt]
 
-        cg_kwargs = geo.get("cg_kwargs", {})
+        # ---- New optimizer / line-search options pulled from config ----
+        optimizer = geo.get("optimizer", "adam")  # keep config default = Adam
+        line_search = geo.get("line_search", "armijo")
+
+        # Adam & Wolfe don't pair well -> gently warn & coerce to armijo
+        if optimizer.lower() == "adam" and line_search.lower() == "strong_wolfe":
+            print("[driver] Warning: Adam + strong_wolfe is not supported; switching to 'armijo'.")
+            line_search = "armijo"
+
+        # Build CG kwargs only for the Jacobian metric
+        mt = geo.get("metric_type", "stein").lower()
+        if mt in {"jacobian", "jsm"}:
+            cg_kwargs = dict(
+                # We intentionally set reg_lambda from lam_metric;
+                # JacobianMetric.apply_inverse does:
+                #   {"reg_lambda": self.lam, **self.cg_kwargs}
+                # so self.lam (== lam_metric) takes precedence — desired behavior.
+                reg_lambda=geo.get("lam_metric", geo.get("reg_lambda", 1e-5)),
+                max_iter=geo.get("cg_max_iter", 50),
+                tol=geo.get("cg_tol", 1e-6),
+                preconditioner=geo.get("cg_preconditioner", "diagonal"),
+                precond_diag_samples=geo.get("cg_precond_diag_samples", 10),
+            )
+        else:
+            cg_kwargs = {}
+
+
+        pd_cfg = geo.get("post_denoise", None)
+        post_denoise_fn = None
+        if isinstance(pd_cfg, dict) and pd_cfg.get("method", "").lower() == "ddim":
+            if len(geo.get("devices", [])) > 1 and pd_cfg.get("shard", False):
+                post_denoise_fn = make_sharded_ddim_post_denoiser(
+                    model, sde, shp, devices=geo["devices"],
+                    to_time=pd_cfg.get("to_time", 1e-3),
+                    steps=pd_cfg.get("steps", 50),
+                )
+            else:
+                post_denoise_fn = make_ddim_post_denoiser(
+                    model, sde, shp,
+                    to_time=pd_cfg.get("to_time", 1e-3),
+                    steps=pd_cfg.get("steps", 50),
+                )
+
 
         path, info, path_history = compute_geodesic(
             p=p_flat, q=q_flat,
             initial_path=init_path_opt,
             model=model, sde=sde, orig_shape=shp,
+
+            # discretisation & schedule
             n_segments=geo.get("n_segments", 16),
             time_schedule=geo.get("time_schedule", [0.03]),
+
+            # regularisers
             lam_smooth=geo.get("lam_smooth", 1e-3),
             lam_mono=geo.get("lam_mono", 0.0),
-            adam_lr=geo.get("adam_lr", 1e-2),
-            betas=geo.get("betas", (0.9, 0.999)),
+
+            # learning / budget (shared)
             max_iters=geo.get("max_iters", 500),
             tol=geo.get("tol", 1e-6),
             patience=geo.get("patience", 30),
-            line_search=geo.get("line_search", 'fixed'),
+
+            # --- optimizer selection & params ---
+            optimizer=optimizer,                                # "adam" | "rgd"
+            adam_lr=geo.get("adam_lr", 1e-2),                   # used by Adam and fixed-step modes
+            betas=geo.get("betas", (0.9, 0.999)),               # Adam only
+            line_search=line_search,                            # "fixed" | "armijo" | "strong_wolfe"
+            use_retraction_update=geo.get("use_retraction_update", True),  # RGD only
+
+            # Armijo (used by Adam or RGD when line_search="armijo")
+            armijo_rho=geo.get("armijo_rho", 1e-4),
+            armijo_beta=geo.get("armijo_beta", 0.5),
+            armijo_max_iter=geo.get("armijo_max_iter", 20),
+
+            # Strong-Wolfe (RGD only when line_search="strong_wolfe")
+            wolfe_c1=geo.get("wolfe_c1", 1e-4),
+            wolfe_c2=geo.get("wolfe_c2", 0.9),
+            wolfe_max_bracket=geo.get("wolfe_max_bracket", 10),
+            wolfe_max_zoom=geo.get("wolfe_max_zoom", 10),
+            wolfe_max_alpha=geo.get("wolfe_max_alpha", 50.0),
+
+            # moment transport (Adam only; ignored by RGD as no momentum)
             transport_mode=geo.get("transport_mode", 'ad_hoc'),
             transport_steps=geo.get("transport_steps", 1),
-            armijo_rho=geo.get("armijo_rho", 0.1),
-            armijo_beta=geo.get("armijo_beta", 0.5),
-            armijo_max_iter=geo.get("armijo_max_iter", 15),
+
+            # metric
             metric_type=geo.get("metric_type", "stein"),
             lam_metric=geo.get("lam_metric", 1.0),
-            cg_kwargs=cg_kwargs, 
+
+            # Jacobian metric CG kwargs
+            cg_kwargs=cg_kwargs,
+
+            devices=geo.get("devices", None),
+            post_denoise_fn=post_denoise_fn,
+            # endpoints policy (ignored if initial_path is provided)
+            endpoint_mode=geo.get("endpoint_mode", "clean"),     # "clean" | "noisy"
+            fixed_noise=None,                                    # or geo.get("fixed_noise", None)
+
             verbose=True,
             vis_kwargs=geo.get("visualization", {}),
         )

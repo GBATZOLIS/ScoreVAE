@@ -92,7 +92,8 @@ def get_optimizer_and_scheduler(model, config, global_step=0):
             lr=config.optim.get('lr', 2e-4),
             betas=(config.optim.get('beta1', 0.9), config.optim.get('beta2', 0.99)),
             eps=config.optim.get('eps', 1e-8),
-            weight_decay=config.optim.get('weight_decay', 0.01)
+            weight_decay=config.optim.get('weight_decay', 0.01),
+            fused=True
         )
     elif config.optim.optimizer == 'Adam':
         optimizer = optim.Adam(

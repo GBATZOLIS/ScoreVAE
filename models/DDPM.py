@@ -1,16 +1,16 @@
+# models/ddpm_unet.py
 """
 UNet-style backbone for score-based diffusion that supports arbitrary image resolutions.
 
 Key points
 ----------
 * Residual Conv + GroupNorm + SiLU with FiLM conditioning.
-* Self-attention at user-configurable resolutions (e.g. 16 × 16).
-* Skip connections saved **before** the channel-doubling ResBlock (fixes concat mismatch).
-* `Up` blocks follow the encoder’s true channel schedule (`skip_channels`).
-* **New fix →** Attention permutation bug squashed (no more *IndexError*).
-* Head dimension now *always* `ch // heads` → uniform across levels.
+* Self-attention at user-configurable resolutions (e.g., 16×16); bottleneck-only by default.
+* Skip connections saved BEFORE the channel-doubling ResBlock (fixes concat mismatch).
+* Up blocks follow the encoder’s true channel schedule (skip_channels).
+* Attention permutation bug squashed (no IndexError).
+* Head dimension always ch // heads → uniform across levels.
 * BatchNorm-free ⇒ vmap-safe.
-* Works on any `base_channels` you set (32–128 tested).
 * Resolution-agnostic: no hard-coded spatial dims.
 """
 from __future__ import annotations
@@ -20,17 +20,30 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # <- use functional alias for SiLU & SDPA
+import torch.nn.functional as F
 
 
 # ─────────────────────────────── helpers ────────────────────────────────
 
+def expand_like(v: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """
+    Expand a [B]-shaped tensor v to broadcast over ref (e.g., [B,C,H,W]).
+    Assumes v is batched (len==B). Does not allocate; uses views.
+    """
+    # make sure v is 1D [B]
+    if v.dim() != 1:
+        v = v.view(-1)
+    # unsqueeze until same ndim as ref
+    while v.dim() < ref.dim():
+        v = v.unsqueeze(-1)
+    return v
+
 def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
     """Sinusoidal position embedding identical to DDPM / Stable-Diffusion."""
     half  = dim // 2
-    freqs = torch.exp(-math.log(10_000) * torch.arange(half,
-                                                      dtype=t.dtype,
-                                                      device=t.device) / (half - 1))
+    freqs = torch.exp(-math.log(10_000) * torch.arange(
+        half, dtype=t.dtype, device=t.device
+    ) / (half - 1))
     emb = torch.cat([torch.sin(t[:, None] * freqs),
                      torch.cos(t[:, None] * freqs)], dim=-1)
     if dim % 2:
@@ -40,25 +53,18 @@ def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
 
 class FiLM(nn.Module):
     """Feature-wise linear modulation."""
-
     def __init__(self, in_dim: int, out_ch: int):
         super().__init__()
         self.net = nn.Sequential(nn.SiLU(), nn.Linear(in_dim, out_ch * 2))
 
-    def forward(self, x: torch.Tensor, emb: torch.Tensor):  # type: ignore[override]
+    def forward(self, x: torch.Tensor, emb: torch.Tensor):
         scale, shift = self.net(emb).chunk(2, 1)
         return x * (1 + scale.unsqueeze(-1).unsqueeze(-1)) + shift.unsqueeze(-1).unsqueeze(-1)
 
 
 class ResBlock(nn.Module):
     """(Conv → GN → SiLU) × 2 with FiLM in between."""
-
-    def __init__(self,
-                 in_ch: int,
-                 out_ch: int,
-                 emb_dim: int,
-                 p: float = 0.0,
-                 groups: int = 8):
+    def __init__(self, in_ch: int, out_ch: int, emb_dim: int, p: float = 0.0, groups: int = 8):
         super().__init__()
         g = min(groups, out_ch) if out_ch % groups == 0 else 1
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
@@ -70,7 +76,7 @@ class ResBlock(nn.Module):
         self.drop  = nn.Dropout(p)
         self.skip  = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, 1)
 
-    def forward(self, x: torch.Tensor, emb: torch.Tensor):  # type: ignore[override]
+    def forward(self, x: torch.Tensor, emb: torch.Tensor):
         h = self.act(self.norm1(self.conv1(x)))
         h = self.film(h, emb)
         h = self.drop(h)
@@ -80,7 +86,6 @@ class ResBlock(nn.Module):
 
 class AttentionBlock(nn.Module):
     """Multi-head spatial self-attention using PyTorch’s SDP kernel."""
-
     def __init__(self, ch: int, heads: int, _cfg_head_dim: int, p: float):
         super().__init__()
         if ch % heads != 0:
@@ -104,11 +109,10 @@ class AttentionBlock(nn.Module):
         k = k.permute(0, 1, 3, 2).reshape(B * self.heads, N, hdim)
         v = v.permute(0, 1, 3, 2).reshape(B * self.heads, N, hdim)
 
-        # functional alias ensures ∀ Torch versions with SDPA
         out = F.scaled_dot_product_attention(
-                  q, k, v,
-                  dropout_p=self.drop.p if self.training else 0.0   # <<< add
-              )
+            q, k, v,
+            dropout_p=self.drop.p if self.training else 0.0
+        )
 
         out = (out.reshape(B, self.heads, N, hdim)
                    .permute(0, 1, 3, 2)
@@ -121,7 +125,7 @@ class Down(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, 3, 2, 1)
 
-    def forward(self, x):  # type: ignore[override]
+    def forward(self, x):
         return self.conv(x)
 
 
@@ -130,7 +134,7 @@ class Up(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, 3, 1, 1)
 
-    def forward(self, x):  # type: ignore[override]
+    def forward(self, x):
         return self.conv(F.interpolate(x, scale_factor=2, mode="nearest"))
 
 
@@ -138,8 +142,6 @@ class Up(nn.Module):
 
 class DDPM(nn.Module):
     """Flexible UNet backbone for continuous-time score-based diffusion."""
-
-    # ─── constructor ───
     def __init__(self, cfg):
         super().__init__()
 
@@ -152,7 +154,7 @@ class DDPM(nn.Module):
         d_conv    = cfg.dropout_conv
         d_attn    = cfg.dropout_attn
 
-        # ───── stems ─────
+        # stems
         self.time_mlp = nn.Sequential(
             nn.Linear(emb_dim, emb_dim * 4),
             nn.SiLU(),
@@ -160,10 +162,10 @@ class DDPM(nn.Module):
         )
         self.stem = nn.Conv2d(cfg.in_channels, base, 3, 1, 1)
 
-        # channel schedule *before* doubling
+        # channel schedule before doubling
         self.skip_channels: List[int] = [base * (2 ** lv) for lv in range(L)]
 
-        # ───── encoder ─────
+        # encoder
         self.enc, self.downs = nn.ModuleList(), nn.ModuleList()
         ch = base
         for lv in range(L):
@@ -177,14 +179,14 @@ class DDPM(nn.Module):
                 self.downs.append(Down(next_ch, next_ch))
             ch = next_ch
 
-        # ───── bottleneck ─────
+        # bottleneck
         self.mid = nn.ModuleList([
             ResBlock(ch, ch, emb_dim, d_conv),
             AttentionBlock(ch, heads, cfg.head_dim, d_attn),
             ResBlock(ch, ch, emb_dim, d_conv),
         ])
 
-        # ───── decoder ─────
+        # decoder
         self.up_convs = nn.ModuleList([
             Up(self.skip_channels[-i - 1], self.skip_channels[-i - 2])
             for i in range(L - 1)
@@ -193,7 +195,7 @@ class DDPM(nn.Module):
         ch = self.skip_channels[-1]
         for lv in range(L):
             blk = nn.ModuleList()
-            blk.append(ResBlock(ch * 2, ch, emb_dim, d_conv))          # concat → ch
+            blk.append(ResBlock(ch * 2, ch, emb_dim, d_conv))  # concat with skip
             for _ in range(rbl - 1):
                 blk.append(ResBlock(ch, ch, emb_dim, d_conv))
             if 2 ** (L - lv - 1) in attn_res:
@@ -202,23 +204,15 @@ class DDPM(nn.Module):
             if lv < L - 1:
                 ch = self.skip_channels[-lv - 2]
 
-        # ───── output ─────
+        # output
         self.out_norm = nn.GroupNorm(8, base)
         self.out_conv = nn.Conv2d(base, cfg.out_channels, 3, 1, 1)
 
-    # ─────────────────────────── forward ───────────────────────────
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        y: Optional[torch.Tensor] = None,
-        t: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, y: Optional[torch.Tensor] = None, t: Optional[torch.Tensor] = None) -> torch.Tensor:
         if t is None:
             raise ValueError("timestep `t` required")
 
-        emb = self.time_mlp(timestep_embedding(t,
-                                               self.time_mlp[0].in_features))
+        emb = self.time_mlp(timestep_embedding(t, self.time_mlp[0].in_features))
 
         # encoder
         h, skips = self.stem(x), []
@@ -242,44 +236,28 @@ class DDPM(nn.Module):
             for b in blk:
                 h = b(h, emb) if isinstance(b, ResBlock) else b(h)
 
-        # final projection  (torch.silu → F.silu fix)
         return self.out_conv(F.silu(self.out_norm(h)))
 
-    # ─────────────────────────── utils ───────────────────────────
-
+    # utilities
     def get_score_fn(self, sde):
-        """
-        Returns a function that computes the score.
-        
-        Args:
-            sde: The SDE object that provides the marginal probability.
-            train: Boolean flag indicating whether in training mode.
-            
-        Returns:
-            score_fn: A function that computes the score based on the diffusion model's noise prediction.
-        """
         def score_fn(x, y, t):
-            noise_prediction = self.forward(x, y, t)
-            _, std = sde.marginal_prob(x, t)
-            std = std.view(std.shape[0], *[1 for _ in range(len(x.shape) - 1)])  # Expand std to match the shape of noise_prediction
-            score = -noise_prediction / std
-            return score
-        
+            noise_prediction = self.forward(x, y, t)     # [B,C,H,W]
+            _, std = sde.marginal_prob(x, t)             # [B]
+            std = expand_like(std, x)                    # [B,1,1,1]
+            return -noise_prediction / std
         return score_fn
-    
+
     def get_denoiser_fn(self, sde):
-        # Infer the alpha and sigma functions from the SDE
         alpha_fn = sde.get_alpha_fn()
         sigma_fn = sde.get_sigma_fn()
         def denoiser_fn(x_t, y, t):
-            sigma_t, alpha_t = sigma_fn(t), alpha_fn(t)
-            noise_pred = self.forward(x_t, y, t)
-            x_denoised = (x_t - sigma_t * noise_pred) / alpha_t
-            return x_denoised
+            sigma_t = expand_like(sigma_fn(t), x_t)      # [B,1,1,1]
+            alpha_t = expand_like(alpha_fn(t), x_t)      # [B,1,1,1]
+            noise_pred = self.forward(x_t, y, t)         # [B,C,H,W]
+            return (x_t - sigma_t * noise_pred) / alpha_t
         return denoiser_fn
-    
+
     def print_model_summary(self) -> None:
-        """Print parameter counts."""
         tot = sum(p.numel() for p in self.parameters())
         tr  = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"Total parameters: {tot:,}\n  … trainable: {tr:,}\n  … frozen: {tot - tr:,}")

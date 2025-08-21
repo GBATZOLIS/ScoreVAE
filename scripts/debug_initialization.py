@@ -59,30 +59,116 @@ def _to_uint8_img(x: Tensor) -> np.ndarray:
     arr = arr.clamp(0, 1).numpy()
     return (arr * 255.0 + 0.5).astype(np.uint8)
 
-def save_path_grid(path_nodes: List[Tensor], orig_shape: Tuple[int, ...], save_path: str, max_rows: int | None = None):
-    """Path nodes: list of K tensors, each (B_pairs, D). Save as a BxK image grid."""
+def save_path_grid(
+    path_nodes: List[torch.Tensor],
+    orig_shape: Tuple[int, ...],
+    save_path: str,
+    max_rows: int | None = None,
+):
+    """
+    Path nodes: list of K tensors, each (B_pairs, D).
+    If orig_shape is image-like (C,H,W with H,W>1), save a BxK image grid.
+    Otherwise, plot vector trajectories (2D/3D) or a compact high-D fallback.
+    """
+    import os
+    import torch
+    import matplotlib.pyplot as plt
+
     K = len(path_nodes)
-    B_pairs = path_nodes[0].size(0)
+    if K == 0:
+        return
+
+    B_pairs, D = path_nodes[0].shape
     if max_rows is not None:
         B_pairs = min(B_pairs, max_rows)
-    imgs_per_node = [unflatten(p[:B_pairs], orig_shape).cpu() for p in path_nodes]  # K x (B,C,H,W)
-    rows = []
-    for b in range(B_pairs):
-        row_imgs = [imgs_per_node[k][b] for k in range(K)]  # list of (C,H,W)
-        rows.append(torch.cat(row_imgs, dim=-1))
-    grid = torch.cat(rows, dim=-2)
 
-    arr = _to_uint8_img(grid)
-    plt.figure(figsize=(max(3, K) * 1.2, max(2, B_pairs) * 1.2))
-    if arr.ndim == 2:
-        plt.imshow(arr, cmap='gray', vmin=0, vmax=255)
-    else:
-        plt.imshow(arr)
-    plt.axis('off')
+    def _is_image_shape(shp):
+        return (
+            isinstance(shp, (tuple, list))
+            and len(shp) == 3
+            and shp[-1] > 1
+            and shp[-2] > 1
+        )
+
+    # ---------- IMAGE CASE ----------
+    if _is_image_shape(orig_shape):
+        # Expect unflatten to map (B,D) -> (B,C,H,W)
+        imgs_per_node = [unflatten(p[:B_pairs], orig_shape).cpu() for p in path_nodes]  # K x (B,C,H,W)
+        rows = []
+        for b in range(B_pairs):
+            row_imgs = [imgs_per_node[k][b] for k in range(K)]  # list of (C,H,W)
+            rows.append(torch.cat(row_imgs, dim=-1))            # (C,H, K*W)
+        grid = torch.cat(rows, dim=-2)                          # (C, B*H, K*W)
+
+        arr = _to_uint8_img(grid)  # existing helper
+        plt.figure(figsize=(max(3, K) * 1.2, max(2, B_pairs) * 1.2))
+        if arr.ndim == 2:
+            plt.imshow(arr, cmap='gray', vmin=0, vmax=255)
+        else:
+            plt.imshow(arr)
+        plt.axis('off')
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+        plt.close()
+        print(f"Saved path grid to {save_path}")
+        return
+
+    # ---------- VECTOR CASE ----------
+    # No images; plot trajectories.
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
-    plt.close()
-    print(f"Saved path grid to {save_path}")
+
+    # Build list K x (B_pairs, D) -> for easy indexing
+    nodes = [p[:B_pairs].detach().cpu() for p in path_nodes]
+
+    # 2D trajectories
+    if D == 2:
+        fig = plt.figure(figsize=(max(3, K) * 1.0, max(2, B_pairs) * 1.2))
+        for b in range(B_pairs):
+            ax = fig.add_subplot(B_pairs, 1, b + 1)
+            xs = [nodes[k][b, 0].item() for k in range(K)]
+            ys = [nodes[k][b, 1].item() for k in range(K)]
+            ax.plot(xs, ys, marker='o', linewidth=1)
+            ax.axis('equal')
+            ax.axis('off')
+        fig.tight_layout()
+        fig.savefig(save_path, bbox_inches='tight', pad_inches=0)
+        plt.close(fig)
+        print(f"Saved 2D path trajectories to {save_path}")
+        return
+
+    # 3D trajectories
+    if D == 3:
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (needed for 3D projection)
+        fig = plt.figure(figsize=(max(3, K) * 1.0, max(2, B_pairs) * 1.2))
+        for b in range(B_pairs):
+            ax = fig.add_subplot(B_pairs, 1, b + 1, projection='3d')
+            xs = [nodes[k][b, 0].item() for k in range(K)]
+            ys = [nodes[k][b, 1].item() for k in range(K)]
+            zs = [nodes[k][b, 2].item() for k in range(K)]
+            ax.plot(xs, ys, zs, marker='o', linewidth=1)
+            ax.set_axis_off()
+        fig.tight_layout()
+        fig.savefig(save_path, bbox_inches='tight', pad_inches=0)
+        plt.close(fig)
+        print(f"Saved 3D path trajectories to {save_path}")
+        return
+
+    # High-D fallback: plot value vs node-index for first few dims
+    max_dims_show = min(4, D)
+    fig = plt.figure(figsize=(max(3, K) * 1.0, max(2, B_pairs) * 1.2))
+    for b in range(B_pairs):
+        ax = fig.add_subplot(B_pairs, 1, b + 1)
+        vals = torch.stack([nodes[k][b] for k in range(K)], dim=0)  # (K, D)
+        ax.plot(vals[:, :max_dims_show].numpy(), linewidth=1)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim(0, K - 1)
+        # optional: annotate dims
+        # ax.legend([f"d{i}" for i in range(max_dims_show)], loc="upper right", fontsize=6)
+    fig.tight_layout()
+    fig.savefig(save_path, bbox_inches='tight', pad_inches=0)
+    plt.close(fig)
+    print(f"Saved high-D path summary to {save_path}")
+
 
 # ---------------------------------------------------------------------
 # Score & DDIM machinery (VPSDE)
@@ -178,6 +264,100 @@ def solve_reverse_ddim_to(x_flat: Tensor, orig_shape: Tuple[int, ...],
     device, dtype = x_flat.device, x_flat.dtype
     t_grid = torch.linspace(sde.T, t_target, steps + 1, device=device, dtype=dtype)
     return _ddim_evolve_flat(x_flat, orig_shape, sde, model, t_grid)
+
+def solve_reverse_ddim_from_to(x_flat: Tensor,
+                               orig_shape: Tuple[int, ...],
+                               sde: SDE, model: Model,
+                               t_start: float, t_target: float,
+                               steps: int) -> Tensor:
+    """
+    Deterministic DDIM evolution from time t_start -> t_target (t_target <= t_start).
+    x_flat is assumed to be distributed at t_start.
+    """
+    device = x_flat.device
+    dtype  = x_flat.dtype
+    t0 = torch.as_tensor(float(t_start),  device=device, dtype=dtype)
+    t1 = torch.as_tensor(float(t_target), device=device, dtype=dtype)
+    # note: works for any ordering; if t_target==t_start it's a no-op
+    t_grid = torch.linspace(t0, t1, steps + 1, device=device, dtype=dtype)
+    return _ddim_evolve_flat(x_flat, orig_shape, sde, model, t_grid)
+
+def make_ddim_post_denoiser(model, sde, orig_shape, *, to_time=1e-3, steps=50):
+    """
+    Returns a function (x_flat, t_start) -> x_flat_decoded
+    that deterministically decodes with DDIM from t_start to to_time.
+    Runs on whatever device x_flat is on.
+    """
+    def fn(x_flat: torch.Tensor, t_start: float) -> torch.Tensor:
+        return solve_reverse_ddim_from_to(
+            x_flat, orig_shape, sde, model,
+            t_start=float(t_start), t_target=float(to_time), steps=int(steps)
+        )
+    return fn
+
+def make_sharded_ddim_post_denoiser(model, sde, orig_shape, devices, *, to_time=1e-3, steps=50):
+    """
+    Returns a function (x_flat, t_start) -> x_flat_decoded that shards the DDIM
+    decode across multiple GPUs listed in `devices`. The callable can be re-used
+    across many calls; model copies are held inside the closure.
+    """
+    dev_objs = [torch.device(d) for d in devices]
+    primary = dev_objs[0]
+
+    # Prepare per-device model copies once (eval, frozen)
+    models = []
+    for d in dev_objs:
+        m = copy.deepcopy(model).to(d).eval()
+        for p in m.parameters():  # extra safety
+            p.requires_grad_(False)
+        models.append(m)
+
+    streams = {d: torch.cuda.Stream(device=d) for d in dev_objs}
+
+    def _chunk_sizes(n, k):
+        base = n // k
+        rem = n % k
+        sizes = [base] * k
+        for i in range(rem):
+            sizes[i] += 1
+        return sizes
+
+    def fn(x_flat: torch.Tensor, t_start: float) -> torch.Tensor:
+        assert x_flat.is_contiguous(), "x_flat should be contiguous (N,D)."
+        N = x_flat.shape[0]
+        if N == 0:
+            return x_flat
+
+        # plan chunks
+        sizes = _chunk_sizes(N, len(dev_objs))
+        starts = [0]
+        for s in sizes[:-1]:
+            starts.append(starts[-1] + s)
+
+        # async per-device
+        out_parts = [None] * len(dev_objs)
+        for i, d in enumerate(dev_objs):
+            st, sz = starts[i], sizes[i]
+            if sz == 0:
+                out_parts[i] = torch.empty(0, *x_flat.shape[1:], device=primary, dtype=x_flat.dtype)
+                continue
+            sl = slice(st, st + sz)
+            with torch.cuda.stream(streams[d]):
+                x_dev = x_flat[sl].to(d, non_blocking=True)
+                y_dev = solve_reverse_ddim_from_to(
+                    x_dev, orig_shape, sde, models[i],
+                    t_start=float(t_start), t_target=float(to_time), steps=int(steps)
+                )
+                out_parts[i] = y_dev.to(primary, non_blocking=True)
+
+        # sync to primary
+        prim_stream = torch.cuda.current_stream(primary)
+        for d in dev_objs:
+            prim_stream.wait_stream(streams[d])
+
+        return torch.cat(out_parts, dim=0)
+
+    return fn
 
 def generate_ode_initialized_path(
     p: Tensor, q: Tensor, sde: SDE, model: Model,
