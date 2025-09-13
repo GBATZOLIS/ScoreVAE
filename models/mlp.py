@@ -49,25 +49,47 @@ class mlp(nn.Module):
         print(f"Total number of non-trainable parameters: {total_non_trainable_params}")
     
     def get_score_fn(self, sde):
-        # Get the sigma function from the SDE
         sigma_fn = sde.get_sigma_fn()
-        
+
+        def _expand_time_like(x_like: torch.Tensor, t_vec: torch.Tensor) -> torch.Tensor:
+            if t_vec.dim() == 0:
+                t_vec = t_vec.unsqueeze(0)
+            if t_vec.dim() == 2 and t_vec.size(-1) == 1:
+                t_vec = t_vec.squeeze(-1)
+            view_shape = (t_vec.shape[0],) + (1,) * (x_like.dim() - 1)
+            return t_vec.view(view_shape)
+
         def score_fn(x_t, y, t):
-            sigma_t = sigma_fn(t)
-            sigma_t = sigma_t.view(sigma_t.shape[0], *[1 for _ in range(len(x_t.shape) - 1)])  # Expand dimensions
+            sigma_t = _expand_time_like(x_t, sigma_fn(t))
             noise_pred = self.forward(x_t, y, t)
-            score = -noise_pred / sigma_t
-            return score
-        
+            return -noise_pred / sigma_t
+
         return score_fn
 
+
     def get_denoiser_fn(self, sde):
-        # Infer the alpha and sigma functions from the SDE
         alpha_fn = sde.get_alpha_fn()
         sigma_fn = sde.get_sigma_fn()
+
+        def _expand_time_like(x_like: torch.Tensor, t_vec: torch.Tensor) -> torch.Tensor:
+            # t_vec: (B,) or (B,1) or scalar; return (B, 1, ..., 1) to match x_like dims
+            if t_vec.dim() == 0:
+                t_vec = t_vec.unsqueeze(0)
+            if t_vec.dim() == 2 and t_vec.size(-1) == 1:
+                t_vec = t_vec.squeeze(-1)  # (B,)
+            view_shape = (t_vec.shape[0],) + (1,) * (x_like.dim() - 1)
+            return t_vec.view(view_shape)
+
         def denoiser_fn(x_t, y, t):
-            sigma_t, alpha_t = sigma_fn(t), alpha_fn(t)
-            noise_pred = self.forward(x_t, y, t)
+            # Predict noise with the network
+            noise_pred = self.forward(x_t, y, t)  # shape (B, state_size, ...)
+
+            # Expand alpha/sigma over feature axes to match x_t / noise_pred
+            sigma_t = _expand_time_like(x_t, sigma_fn(t))
+            alpha_t = _expand_time_like(x_t, alpha_fn(t))
+
+            # EDM-style x0 estimator when the net predicts noise ε
             x_denoised = (x_t - sigma_t * noise_pred) / alpha_t
             return x_denoised
+
         return denoiser_fn

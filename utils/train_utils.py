@@ -80,16 +80,33 @@ def prepare_training_dirs(config):
     os.makedirs(eval_dir, exist_ok=True)
     return tensorboard_dir, checkpoint_dir, eval_dir
 
-def prepare_batch(data, device):
+def prepare_batch(data, device, *, channels_last: bool = True, non_blocking: bool = True, dtype=None):
+    import torch
+
+    def _move(t):
+        if not isinstance(t, torch.Tensor):
+            return t
+        t = t.to(device, non_blocking=non_blocking)
+        if dtype is not None:
+            t = t.to(dtype)
+        # Only 4D image tensors should use channels_last for speed
+        if channels_last and t.ndim == 4:
+            t = t.contiguous(memory_format=torch.channels_last)
+        return t
+
     if isinstance(data, torch.Tensor):
-        return [data.to(device), None]
-    elif isinstance(data, list):
-        if len(data) == 1:
-            return [data[0].to(device), None]
-        else:
-            return [item.to(device) for item in data]
+        x = _move(data)
+        return [x, None]
+
+    elif isinstance(data, (list, tuple)):
+        moved = [_move(item) for item in data]
+        if len(moved) == 1:
+            return [moved[0], None]
+        return moved
+
     else:
         raise ValueError("Unsupported data type.")
+
 
 def print_model_summary(model: nn.Module):
     total_trainable_params = 0
