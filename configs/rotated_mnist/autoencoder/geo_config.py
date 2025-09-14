@@ -6,10 +6,10 @@ CONFIG = {
     "num_pairs": 25,
 
     # diffusion schedule (descending = coarse → fine)
-    "time_schedule": [0.1], #[0.18, 0.17, 0.16, 0.15, 0.14, 0.13, 0.11, 0.09, 0.07, 0.05, 0.04],
+    "time_schedule": [0.13, 0.12, 0.11, 0.10, 0.09, 0.08, 0.07, 0.06, 0.05], #[0.18, 0.17, 0.16, 0.15, 0.14, 0.13, 0.12, 0.11, 0.10], #[0.18, 0.17, 0.16, 0.15, 0.14, 0.13, 0.12, 0.11, 0.09, 0.07], #[0.18, 0.17, 0.16, 0.15, 0.14, 0.13, 0.11, 0.09, 0.07, 0.05, 0.04],
 
     # (A) log and save profiles
-    "entropic_profile": True,
+    "entropic_profile": False,
 
     # (B) replace schedule with entropy-uniform (optional)
     "use_entropic_schedule": False,
@@ -27,13 +27,13 @@ CONFIG = {
     "lam_metric": 5e-2,
 
     # path discretisation & regularisers
-    "n_segments": 25,
-    "lam_smooth": 0.5,
-    "lam_mono":   0.5,
+    "n_segments": 30,
+    "lam_smooth":  1.,
+    "lam_mono":   1.,
 
     # === OPTIMISER ===================================================
     "optimizer": "adam",              # {"adam","rgd"}
-    "adam_lr":   2.5e-2,
+    "adam_lr":   3e-2, #8e-2,
     "betas":     (0.9, 0.999),
     "line_search": "armijo",          # {"fixed","armijo"}
     "armijo_rho":  0.01,
@@ -41,7 +41,7 @@ CONFIG = {
     "armijo_max_iter": 15,
 
     # shared budget / stopping
-    "max_iters": 1250,
+    "max_iters": 250, #500,
     "tol": 1e-6,
     "patience": 50,
 

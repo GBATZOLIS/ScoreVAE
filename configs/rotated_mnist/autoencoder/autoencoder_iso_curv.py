@@ -50,7 +50,7 @@ def get_config():
     model.num_down_levels = 3
     model.ema_decay       = 0.999
     model.compile         = True
-    model.checkpoint      = 'AE_last.pth'
+    model.checkpoint      = 'AE_last_EMA.pth'
 
     # (optional) VAE block — off by default
     model.vae = ml_collections.ConfigDict()

@@ -4,7 +4,7 @@ import ml_collections
 
 def get_config():
     cfg = ml_collections.ConfigDict()
-    cfg.random_seed = 42
+    cfg.random_seed = 48
 
     # ---------------- Training (device/total_steps are overwritten by the driver) ----------------
     cfg.training = tr = ml_collections.ConfigDict()
@@ -31,7 +31,7 @@ def get_config():
     model.dropout    = 0.0
     model.compile    = False
     model.ema_decay  = 0.999
-    model.checkpoint = "LatentDiff_last.pth"
+    model.checkpoint = "LatentDiffPost_last_EMA.pth"
 
     # ---------------- Optimizer / Scheduler (total_steps is injected by the driver) ----------------
     cfg.optim = opt = ml_collections.ConfigDict()

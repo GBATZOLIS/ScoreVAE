@@ -67,6 +67,34 @@ def _build_cg_kwargs(geo_cfg: dict):
         )
     return {}
 
+def _resolve_ae_pair_paths(base_dir: str, ckpt_name: str) -> tuple[str, str]:
+    """
+    Return (running_ckpt, ema_ckpt) absolute paths based on a single name the user provides.
+    Accepts either AE_last.pth or AE_last_EMA.pth and derives the other.
+    """
+    if not ckpt_name.endswith(".pth"):
+        ckpt_name += ".pth"
+    p = os.path.join(base_dir, ckpt_name)
+    # If user passed EMA, derive running
+    if p.endswith("_EMA.pth"):
+        ema_p = p
+        run_p = p.replace("_EMA.pth", ".pth")
+    else:
+        run_p = p
+        ema_p = p.replace(".pth", "_EMA.pth")
+    return run_p, ema_p
+
+
+def _copy_named_buffers(src: nn.Module, dst: nn.Module):
+    """
+    Copy buffers (e.g., latent_norm_mean/std) from src → dst by matching names.
+    Leaves parameters untouched (EMA will govern parameters).
+    """
+    src_bufs = dict(src.named_buffers())
+    for name, buf in dst.named_buffers():
+        if name in src_bufs and src_bufs[name].shape == buf.shape:
+            buf.copy_(src_bufs[name])
+
 
 def _load_ae_exact(model, ema: EMA, ckpt_path: str, device: torch.device):
     """
@@ -90,11 +118,6 @@ def _maybe_load_latent_diffusion_exact(
     latent_cfg_path: str | None = None,
     latent_ckpt_path: str | None = None,
 ):
-    """
-    Load the latent diffusion model exactly as specified, honoring EMA or not
-    from the checkpoint filename. Returns (latent_model, latent_sde) or (None, None).
-    """
-    # choose config
     if latent_cfg_path is None:
         if not hasattr(ae_cfg.loss, "geom") or not hasattr(ae_cfg.loss.geom, "latent"):
             return None, None
@@ -112,13 +135,14 @@ def _maybe_load_latent_diffusion_exact(
         lat_cfg.data.shape = [ae_latent_dim]
         lat_cfg.model.state_size = ae_latent_dim
 
+    # 1) Build model (do NOT freeze yet)
     latent_model = get_model(lat_cfg.model).to(device)
-    for p in latent_model.parameters():
-        p.requires_grad_(False)
-    latent_model.eval()
+    latent_model.train()  # ok to switch to eval later
+
+    # 2) SDE
     latent_sde = configure_sde(lat_cfg)
 
-    # resolve checkpoint (strict, no auto-EMA swap)
+    # 3) Resolve checkpoint
     ckpt = latent_ckpt_path or getattr(lat_cfg.model, "checkpoint", None) or os.path.join(ae_ckpt_dir, "LatentDiff_last.pth")
     if not ckpt.endswith(".pth"):
         ckpt += ".pth"
@@ -132,13 +156,25 @@ def _maybe_load_latent_diffusion_exact(
         return None, None
 
     is_ema = ckpt.endswith("_EMA.pth")
+
+    # 4) Create EMA **before** loading so it can hold a shadow
     ema_lat = EMA(latent_model, decay=float(getattr(lat_cfg.model, "ema_decay", 0.999)))
+
+    # 5) Load (this fills either the model or the EMA shadow depending on is_ema)
     load_model(latent_model, ema_lat, ckpt, "LatentDiff", device=device, is_ema=is_ema)
+
+    # 6) If EMA checkpoint, apply it to the model now
     if is_ema:
         ema_lat.apply_shadow()
 
+    # 7) Only now freeze params and switch to eval
+    for p in latent_model.parameters():
+        p.requires_grad_(False)
+    latent_model.eval()
+
     print(f"[Eval] Latent diffusion model loaded from '{ckpt}' (EMA={is_ema})")
     return latent_model, latent_sde
+
 
 
 # ── unwrap Subset(s) to the base dataset and get indices in the current split
@@ -217,22 +253,41 @@ def eval_autoencoder(
     model = get_model(cfg.model).to(device, memory_format=torch.channels_last)
     ema = EMA(model=model, decay=cfg.model.ema_decay)
 
-    ckpt = cfg.model.checkpoint
-    if ckpt is None:
-        raise ValueError("Set config.model.checkpoint or pass --checkpoint.")
-    if not os.path.isabs(ckpt):
-        ckpt = os.path.join(checkpoint_dir, ckpt)
-    if not ckpt.endswith(".pth"):
-        ckpt += ".pth"
+    # ---- Load both: running (for buffers) and EMA (for weights) ----
+    ck_in = cfg.model.checkpoint
+    if ck_in is None:
+        raise ValueError("Set config.model.checkpoint or pass --checkpoint (either AE_last.pth or AE_last_EMA.pth).")
+    if not os.path.isabs(ck_in):
+        ck_run, ck_ema = _resolve_ae_pair_paths(checkpoint_dir, ck_in)
+    else:
+        base_dir = os.path.dirname(ck_in)
+        ck_run, ck_ema = _resolve_ae_pair_paths(base_dir, os.path.basename(ck_in))
 
-    # EXACT loading: honor filename choice (running vs EMA)
-    _load_ae_exact(model, ema, ckpt, device=device)
+    # 1) Load RUNNING weights into a temporary model to grab buffers
+    model_run = get_model(cfg.model).to(device, memory_format=torch.channels_last)
+    ema_run = EMA(model=model_run, decay=cfg.model.ema_decay)
+    if not os.path.exists(ck_run):
+        raise FileNotFoundError(f"Running checkpoint not found: {ck_run}")
+    load_model(model_run, ema_run, ck_run, "AE", device=device, is_ema=False)
+    # No apply_shadow here; we just want its buffers.
+
+    # 2) Load EMA weights into the real model
+    if not os.path.exists(ck_ema):
+        raise FileNotFoundError(f"EMA checkpoint not found: {ck_ema}")
+    load_model(model, ema, ck_ema, "AE", device=device, is_ema=True)
+    ema.apply_shadow()  # switch parameters to EMA weights
+
+    # 3) Copy normalization (and any other) buffers from running → EMA model
+    _copy_named_buffers(model_run, model)
+
     model.eval()
 
-    # (optional) quick sanity print
+    # (Optional) quick sanity print
     with torch.no_grad():
-        print("[AE buffers] μ[:4]:", model.latent_norm_mean[:4].tolist(),
-              "σ[:4]:", model.latent_norm_std[:4].tolist())
+        print("[AE buffers copied from RUNNING] μ[:4]:",
+            model.latent_norm_mean[:4].tolist(),
+            "σ[:4]:", model.latent_norm_std[:4].tolist())
+
 
     # always: latent scatter + recon grid (+ optionally prior variance diagnostics)
     latent_cb = get_latent_scatter_callback(num_batches=num_batches, max_points=max_points)
@@ -424,6 +479,7 @@ def eval_autoencoder(
                 post_denoise_fn=None,
                 endpoint_mode=str(geo.get("endpoint_mode", "clean")),
                 fixed_noise=None,  # relevant only if endpoint_mode=="noisy"
+                init_nseeds=5,
             )
 
             # ── FIX: realized frames are number of path knots, not batch size
