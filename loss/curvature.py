@@ -4,6 +4,7 @@ from typing import Callable, Dict, Optional, Tuple
 import torch
 from torch import Tensor
 from torch.func import jvp, vjp, vmap, grad
+from torch.func import jacfwd, jacrev
 
 # ====================================================================================
 # Small helpers
@@ -88,34 +89,37 @@ def _H_mixed_fd_batched(
 # Build J, G, L in batch
 # ====================================================================================
 
-def _build_J_and_G_batched(decode, z: Tensor, lam: float) -> Tuple[Tensor, Tensor, Tensor]:
+def _build_J_and_G_batched(
+    decode,
+    z: Tensor,
+    lam: float
+) -> Tuple[Tensor, Tensor, Tensor]:
     """
-    Build per-sample Jacobians and pullback metrics in batch.
-      z: (B,d)
-    Returns:
-      J: (B, D, d)
-      G: (B, d, d)   with G = J^T J + lam I
-      L: (B, d, d)   lower Cholesky of G
+    Build per-sample Jacobians and pullback metrics in batch using jacfwd/jacrev.
+
+    Heuristic:
+      - If d <= D, use jacfwd (forward-mode): cost ~ O(d)
+      - Else       use jacrev (reverse-mode): cost ~ O(D)
     """
     B, d = z.shape
     f_single = _as_single_map(decode)
 
+    # Peek D once to choose the mode
     with torch.no_grad():
         D = decode(z[:1]).reshape(1, -1).size(1)
 
-    I = torch.eye(d, device=z.device, dtype=z.dtype)
+    # Choose forward- or reverse-mode Jacobian
+    use_fwd = (d <= D)
+    jac_fn = jacfwd(f_single) if use_fwd else jacrev(f_single)
 
-    def J_cols_for_sample(zi: Tensor) -> Tensor:              # -> (d, D)
-        return vmap(lambda e: _Jv(f_single, zi, e))(I)
+    # J: (B, D, d)
+    J = vmap(jac_fn)(z)
 
-    J_cols = vmap(J_cols_for_sample)(z)                       # (B,d,D)
-    J = J_cols.transpose(1, 2).contiguous()                   # (B,D,d)
-
-    JT = J.transpose(1, 2)                                    # (B,d,D)
-    G = JT @ J                                                # (B,d,d)
+    JT = J.transpose(1, 2)               # (B, d, D)
+    G = JT @ J                            # (B, d, d)
     if lam != 0.0:
         G = G + lam * torch.eye(d, device=z.device, dtype=z.dtype).expand(B, d, d)
-    L = torch.linalg.cholesky(G)                              # (B,d,d)
+    L = torch.linalg.cholesky(G)          # (B, d, d)
     return J, G, L
 
 # ====================================================================================
@@ -175,6 +179,30 @@ def _dir_dTv_batched(
 
     return term1 + term2
 
+def _dir_dTv_many_w(
+    decode,
+    z: Tensor,          # (B,d)
+    J: Tensor,          # (B,D,d)
+    L: Tensor,          # (B,d,d)
+    v: Tensor,          # (B,D)
+    W: Tensor,          # (B,K_w,d)
+    use_exact_hessian: bool = True,
+    fd_eps: float = 1e-3,
+) -> Tensor:
+    """
+    Vectorized version of _dir_dTv_batched over multiple latent directions.
+    W: (B, K_w, d) -> returns (B, K_w, D)
+    """
+    return vmap(
+        lambda w_single: _dir_dTv_batched(
+            decode, z, J, L, v, w_single,
+            use_exact_hessian=use_exact_hessian,
+            fd_eps=fd_eps,
+        ),
+        in_dims=1,  # map over K_w
+        out_dims=1
+    )(W)
+
 # ====================================================================================
 # MECAE estimator (batched, non-negative default)
 # ====================================================================================
@@ -221,45 +249,59 @@ def mecae_extrinsic_decoder(
         V = torch.randn(B, K_v, D, device=dev, dtype=dt)
         W = torch.randn(B, K_w, d, device=dev, dtype=dt)
 
-    # Precompute G^{-1/2} w_k via triangular solves: s = L^{-T} w
+    # Precompute G^{-1/2} W via triangular solves: S = L^{-T} W
     U = L.transpose(1, 2)                               # (B,d,d) upper
     W_T = W.transpose(1, 2)                             # (B,d,K_w)
     S_T = _solve_upper_tri_batch(U, W_T)                # (B,d,K_w)
-    S = S_T.transpose(1, 2).contiguous()                # (B,K_w,d)
+    S   = S_T.transpose(1, 2).contiguous()              # (B,K_w,d)
 
-    # Accumulate energies across probes (batched across samples)
-    eec_acc = torch.zeros(B, device=dev, dtype=dt)
+    if estimator == "square":
+        # Vectorize across K_v and K_w:
+        # For each kv: D_many = ∂(T v_kv)·(G^{-1/2} W)  -> (B,K_w,D)
+        # Stack across kv -> (B,K_v,K_w,D)
+        D_many_all = vmap(
+            lambda v_row: _dir_dTv_many_w(
+                decode, z, J, L, v_row, S,
+                use_exact_hessian=use_exact_hessian,
+                fd_eps=fd_eps,
+            ),
+            in_dims=1,  # map over K_v
+            out_dims=1
+        )(V)  # (B,K_v,K_w,D)
 
-    for kv in range(K_v):
-        v = V[:, kv, :]                                 # (B,D)
-        if estimator == "square":
-            for kw in range(K_w):
-                s = S[:, kw, :]                         # (B,d) = G^{-1/2} w
-                ddir = _dir_dTv_batched(
-                    decode, z, J, L, v, s,
-                    use_exact_hessian=use_exact_hessian,
-                    fd_eps=fd_eps,
-                )                                       # (B,D)
-                eec_acc = eec_acc + (ddir * ddir).sum(dim=-1)
-        elif estimator == "bilinear":
-            for kw in range(K_w):
-                w = W[:, kw, :]
-                d_w  = _dir_dTv_batched(
-                    decode, z, J, L, v, w,
-                    use_exact_hessian=use_exact_hessian,
-                    fd_eps=fd_eps,
-                )
-                wtil = _chol_solve_batch(L, w)          # (B,d) = G^{-1} w
-                d_wt = _dir_dTv_batched(
-                    decode, z, J, L, v, wtil,
-                    use_exact_hessian=use_exact_hessian,
-                    fd_eps=fd_eps,
-                )
-                eec_acc = eec_acc + (d_w * d_wt).sum(dim=-1)
-        else:
-            raise ValueError(f"Unknown estimator '{estimator}'. Use 'square' or 'bilinear'.")
+        # Sum ||·||^2 over D, then average over K_v * K_w
+        eec_acc = (D_many_all * D_many_all).sum(dim=-1).sum(dim=-1).sum(dim=-2)  # (B,)
+        eec = 0.5 * eec_acc / (K_v * K_w)
 
-    eec = 0.5 * eec_acc / (K_v * K_w)                   # (B,)
+    elif estimator == "bilinear":
+        # Compute Wtil = G^{-1} W  -> (B,K_w,d)
+        Wtil_T = _chol_solve_batch(L, W_T)  # (B,d,K_w)
+        Wtil   = Wtil_T.transpose(1, 2).contiguous()  # (B,K_w,d)
+
+        def per_kv(v_row: Tensor) -> Tensor:
+            # (B,K_w,D) each
+            dW    = _dir_dTv_many_w(
+                decode, z, J, L, v_row, W,
+                use_exact_hessian=use_exact_hessian,
+                fd_eps=fd_eps,
+            )
+            dWtil = _dir_dTv_many_w(
+                decode, z, J, L, v_row, Wtil,
+                use_exact_hessian=use_exact_hessian,
+                fd_eps=fd_eps,
+            )
+            # ⟨d_w, d_{wtil}⟩ over D -> (B,K_w)
+            return (dW * dWtil).sum(dim=-1)
+
+        # Map over K_v -> (B,K_v,K_w)
+        bil_terms = vmap(per_kv, in_dims=1, out_dims=1)(V)
+        # Sum over K_w and K_v
+        eec_acc = bil_terms.sum(dim=-1).sum(dim=-1)  # (B,)
+        eec = 0.5 * eec_acc / (K_v * K_w)
+
+    else:
+        raise ValueError(f"Unknown estimator '{estimator}'. Use 'square' or 'bilinear'.")
+
     if return_aux:
         return {"EEC": eec, "J": J, "G": G, "L": L}
     else:
@@ -268,6 +310,37 @@ def mecae_extrinsic_decoder(
 # ====================================================================================
 # MICAE (intrinsic curvature via Gauss equation + Hutchinson)
 # ====================================================================================
+
+# Project Xi into the normal space without forming N
+def _project_normals_functionally(J, L, Xi, ref=None, eps: float = 1e-8) -> Tensor:
+    # J: (B, D, m), L: (B, m, m), Xi: (R_a, B, D)
+    Xi_BDR = Xi.permute(1, 2, 0)                         # (B, D, R_a)
+
+    # --- FIX 1: keep 'm' = latent dim, 'd' = ambient dim consistently ---
+    JT_Xi  = torch.einsum('bmd,bdk->bmk', J.transpose(1, 2), Xi_BDR)  # (B, m, R_a)
+
+    Y      = _chol_solve_batch(L, JT_Xi)                  # (B, m, R_a)
+
+    # --- FIX 2: J is (B, D, m) so use 'bdm' here, not 'bmd' ---
+    JY     = torch.einsum('bdm,bmk->bdk', J, Y)           # (B, D, R_a)
+
+    A_BDR  = Xi_BDR - JY                                  # (B, D, R_a)
+    A      = A_BDR.permute(2, 0, 1).contiguous()          # (R_a, B, D)
+
+    if ref is not None:
+        JT_ref = torch.einsum('bmd,bd->bm', J.transpose(1, 2), ref)   # (B, m)
+        Y_ref  = _chol_solve_batch(L, JT_ref)                          # (B, m)
+        # J is (B, D, m)  → use 'bdm'
+        JY_ref = torch.einsum('bdm,bm->bd', J, Y_ref)                  # (B, D)
+        pref   = ref - JY_ref                                          # (B, D)
+        while pref.dim() < A.dim():
+            pref = pref.unsqueeze(0)
+        nrm = A.norm(dim=-1, keepdim=True)
+        A   = torch.where(nrm > eps, A, A + pref)
+
+    return A / (A.norm(dim=-1, keepdim=True) + eps)
+
+
 
 @torch.no_grad()
 def _build_normal_projector(J: Tensor, G: Tensor, L: Tensor) -> Tensor:
@@ -341,6 +414,7 @@ def _II_multi_in_normals(
         lambda a_b: _II_in_normal_dir_batched(decode, z, a_b, use_exact_hessian, fd_eps)
     )(A)  # (R_a,B,m,m)
 
+
 def micae_intrinsic_decoder(
     *,
     decode: Callable[[Tensor], Tensor],
@@ -354,18 +428,6 @@ def micae_intrinsic_decoder(
     normalize_codim: bool = True,  # average over normals instead of multiplying by codim
     return_aux: bool = False,
 ) -> Dict[str, Tensor]:
-    """
-    MICAE: intrinsic curvature penalty using the Gauss equation in Euclidean ambient.
-
-    Scalar curvature per sample (Gauss):
-        R(z) = sum_{a=1}^{D-m} [ (tr S_a)^2 - ||S_a||_F^2 ],  where S_a = G^{-1} II^(a).
-
-    We estimate the sum over an orthonormal basis of normals via Hutchinson:
-        sum_a ≈ codim * E_a[ (tr S_a)^2 - ||S_a||_F^2 ].
-    If `normalize_codim=True`, we average instead of multiplying by codim (more stable for large codim).
-
-    The MICAE loss uses R(z)^2 (squared scalar curvature) per sample: EIC(z) = R(z)^2.
-    """
     assert z.dim() == 2, "z must be (B,m)"
     dev, dt = z.device, z.dtype
     B, m = z.shape
@@ -381,24 +443,30 @@ def micae_intrinsic_decoder(
         D = decode(z[:1]).reshape(1, -1).size(1)
     codim = max(0, int(D) - int(m))
 
-    # Trivial intrinsic curvature cases
+    # Trivial intrinsic curvature cases: still emit debug scalars so logs exist
     if (m < 2) or (codim == 0):
-        out = {"EIC": torch.zeros(B, device=dev, dtype=dt)}
+        diagL = L.diagonal(dim1=-1, dim2=-2)  # (B,m)
+        out = {
+            "EIC": torch.zeros(B, device=dev, dtype=dt),
+            "reg/G_min_diagL":    torch.as_tensor(diagL.min().detach().item(), device=dev),
+            "reg/G_mean_diagL":   torch.as_tensor(diagL.mean().detach().item(), device=dev),
+            "reg/micae_R_mean":       torch.tensor(0.0, device=dev),
+            "reg/micae_R_absmean":    torch.tensor(0.0, device=dev),
+            "reg/micae_trSa2_mean":   torch.tensor(0.0, device=dev),
+            "reg/micae_fro2_mean":    torch.tensor(0.0, device=dev),
+            "reg/micae_II_fro2_mean": torch.tensor(0.0, device=dev),
+        }
         if return_aux:
             out.update({"J": J, "G": G, "L": L})
         return out
 
-    # Normal projector
-    with torch.no_grad():
-        N = _build_normal_projector(J, G, L)  # (B,D,D)
+    # Probes for normals
+    Xi = _sample_rademacher((R_a, B, D), dev, dt) if use_rademacher else \
+         torch.randn(R_a, B, D, device=dev, dtype=dt)
 
-    # Sample normals in the normal space
-    if use_rademacher:
-        Xi = _sample_rademacher((R_a, B, D), dev, dt)
-    else:
-        Xi = torch.randn(R_a, B, D, device=dev, dtype=dt)
+    # Safety ref for projection
     ref = torch.zeros(B, D, device=dev, dtype=dt); ref[:, 0] = 1.0
-    A = _project_and_normalize(N, Xi, ref=ref)  # (R_a,B,D)
+    A = _project_normals_functionally(J, L, Xi, ref=ref)  # (R_a,B,D)
 
     # Second fundamental forms and shape operators
     II_all = _II_multi_in_normals(decode, z, A, use_exact_hessian, fd_eps)  # (R_a,B,m,m)
@@ -410,14 +478,28 @@ def micae_intrinsic_decoder(
     trSa  = Sa_all.diagonal(dim1=-1, dim2=-2).sum(-1)        # (R_a,B)
     fro2  = (Sa_all * Sa_all).sum(dim=(-1, -2))              # (R_a,B)
     est   = (trSa.pow(2) - fro2).mean(dim=0)                 # (B,)
-    if normalize_codim:
-        R_est = est                                          # average over normals
-    else:
-        R_est = codim * est                                  # sum over orthonormal normals
+    R_est = est if normalize_codim else codim * est          # (B,)
+    EIC   = R_est.pow(2)                                     # (B,)
 
-    EIC   = R_est.pow(2)                                     # squared scalar curvature (B,)
+    # Debug scalars (as tensors so generic loggers can ingest)
+    diagL = L.diagonal(dim1=-1, dim2=-2)                     # (B,m)
+    R_mean        = R_est.mean()
+    R_absmean     = R_est.abs().mean()
+    trSa2_mean    = (trSa.pow(2)).mean()
+    fro2_mean     = fro2.mean()
+    II_fro2_mean  = (II_all * II_all).sum(dim=(-1, -2)).mean()
 
-    out = {"EIC": EIC}
+    out = {
+        "EIC": EIC,
+        "reg/G_min_diagL":    torch.as_tensor(diagL.min().detach().item(), device=dev),
+        "reg/G_mean_diagL":   torch.as_tensor(diagL.mean().detach().item(), device=dev),
+        "reg/micae_R_mean":       torch.as_tensor(R_mean.detach().item(), device=dev),
+        "reg/micae_R_absmean":    torch.as_tensor(R_absmean.detach().item(), device=dev),
+        "reg/micae_trSa2_mean":   torch.as_tensor(trSa2_mean.detach().item(), device=dev),
+        "reg/micae_fro2_mean":    torch.as_tensor(fro2_mean.detach().item(), device=dev),
+        "reg/micae_II_fro2_mean": torch.as_tensor(II_fro2_mean.detach().item(), device=dev),
+    }
     if return_aux:
         out.update({"J": J, "G": G, "L": L})
     return out
+

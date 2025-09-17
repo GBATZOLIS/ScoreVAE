@@ -33,7 +33,17 @@ from data.data_utils_ddp import get_dataloaders
 from loss.ae_loss import ae_loss
 from sde import configure_sde
 
-
+# Enable TF32 paths on Ampere+ GPUs (harmless elsewhere).
+if torch.cuda.is_available():
+    # cuDNN (convs, batchnorm, etc.)
+    torch.backends.cudnn.allow_tf32 = True
+    # matmul/linear ops
+    try:
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:
+        # older PyTorch fallback
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
 # ---------------- DDP helpers ----------------
 
 def ddp_is_active() -> bool:
@@ -614,7 +624,10 @@ def train(cfg):
         ema.restore()
 
         # ---- end-of-epoch latent μ/σ update (DDP-aware callback) ----
-        if latent_model is not None:
+        # Get the update frequency from the config
+        update_norm_freq = getattr(cfg.training, "update_norm_frequency", 1)
+
+        if latent_model is not None and ((epoch + 1) % update_norm_freq == 0):
             latent_norm_cb(val_loader, writer if ddp_rank() == 0 else _NullWriter(), ae_mod, device, epoch)
             # Broadcast updated buffers so all ranks agree
             if ddp_is_active():

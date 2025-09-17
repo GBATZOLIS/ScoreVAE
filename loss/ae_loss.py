@@ -114,6 +114,8 @@ def ae_loss(
     me_iter_val: Optional[float] = None   # MECAE EEC
     mi_iter_val: Optional[float] = None   # MICAE EIC
 
+    metrics: Dict[str, Optional[float]] = {}
+
     curv_w = float(getattr(cfg.loss, "curvature_weight", 0.0))  # MECAE weight
     intr_w = float(getattr(cfg.loss, "intrinsic_weight", 0.0))  # MICAE weight
 
@@ -196,11 +198,22 @@ def ae_loss(
                 eic = mi_out["EIC"].mean().to(x.dtype)
                 total += intr_w * eic
                 mi_iter_val = float(eic.detach().item())
+                
+                # ---- expose MICAE debug scalars (prefixed) ----
+                # NOTE: mi_out contains tensors; we forward only 0-D scalars.
+                for k, v in mi_out.items():
+                    if k == "EIC":
+                        continue
+                    if isinstance(v, torch.Tensor) and v.ndim == 0 and torch.isfinite(v):
+                        # This line no longer causes an error because `metrics` exists.
+                        metrics[f"reg/micae/{k}"] = float(v.detach().item())
+                # also add the batch-mean EIC under a clear key
+                metrics["reg/micae/EIC_mean"] = mi_iter_val
 
     if train:
         setattr(model, step_attr, int(step) + 1)
 
-    metrics: Dict[str, Optional[float]] = {
+    metrics.update({
         "loss/total":          float(total.detach().item()),
         "loss/reconstruction": float(rec.detach().item()),
         "loss/kl":             float(kl.detach().item()),
@@ -208,5 +221,6 @@ def ae_loss(
         "reg/dec_iso":         float(dec_iso.detach().item()),
         "reg/mecae_eec":       me_iter_val,
         "reg/micae_eic":       mi_iter_val,
-    }
+    })
+
     return total, metrics

@@ -28,6 +28,12 @@ try:
 except Exception:
     RenderedTeapots = None  # still works if the new file isn't present
 
+# NEW: Analytic S^2 / T^2 (no rendering)
+try:
+    from .analytic_manifold_dataset import AnalyticManifoldDataset
+except Exception:
+    AnalyticManifoldDataset = None
+
 # NEW: Rotated MNIST (pad→rotate SO(2))
 try:
     from .rotated_mnist_dataset import RotatedMNIST
@@ -197,6 +203,39 @@ def get_dataloaders(
         return (train_loader, val_loader, test_loader, samplers) if return_samplers \
             else (train_loader, val_loader, test_loader)
 
+    # ───────────────── Analytic S^2 / T^2 (no 3D; exact geodesics) ─────────────────
+    elif name in {"analytic_manifold_dataset", "analytic_manifold"}:
+        if AnalyticManifoldDataset is None:
+            raise ImportError("datasets/analytic_manifold_dataset.py not found or failed to import.")
+        ds = AnalyticManifoldDataset(args, seed=seed)
+
+        g = torch.Generator().manual_seed(seed)
+        n = len(ds)
+        train_len = int(0.9 * n)
+        val_len   = int(0.05 * n)
+        test_len  = n - train_len - val_len
+        train_ds, val_ds, test_ds = random_split(ds, [train_len, val_len, test_len], generator=g)
+
+        workers = getattr(args, "n_workers", 8)
+        pin_mem = torch.cuda.is_available()
+
+        train_loader, train_sampler = _maybe_sampler(
+            train_ds, shuffle=True, drop_last=True, batch_size=bs, n_workers=workers,
+            distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
+        )
+        val_loader, val_sampler = _maybe_sampler(
+            val_ds, shuffle=False, drop_last=False, batch_size=bs, n_workers=workers,
+            distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
+        )
+        test_loader, test_sampler = _maybe_sampler(
+            test_ds, shuffle=False, drop_last=False, batch_size=bs, n_workers=workers,
+            distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
+        )
+
+        samplers.update({"train": train_sampler, "val": val_sampler, "test": test_sampler})
+        return (train_loader, val_loader, test_loader, samplers) if return_samplers \
+            else (train_loader, val_loader, test_loader)
+    
     # ───────────────────── lightweight branches (unchanged) ───────────────────
     elif name == "sphere":
         train_ds, val_ds, test_ds = random_split(

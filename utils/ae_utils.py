@@ -10,6 +10,7 @@ import torch
 import torchvision.utils as vutils
 import matplotlib.pyplot as plt
 
+from .vis_utils import save_latent_scatter_artifacts
 
 # Try to import SummaryWriter only if available
 try:
@@ -196,6 +197,9 @@ def get_latent_scatter_callback(
     point_size_3d: float = 4.0,
     alpha_2d: float = 0.6,
     alpha_3d: float = 0.6,
+    # NEW knobs (forwarded to vis_utils.save_latent_mesh_artifacts)
+    prefer_mesh: str = "poisson",     # "poisson" | "bpa" | "auto"
+    target_faces: int = 20000,        # triangle budget for the saved mesh
 ):
     """
     Plots latent scatters.
@@ -203,7 +207,11 @@ def get_latent_scatter_callback(
         - "raw"  : z = model.encode(x)
         - "norm" : ẑ = model.normalize_latent(model.encode(x)) if available else z
         - "both" : logs both; 3D is ONLY for 'norm'
-    DDP-aware: gathers a subsample from all ranks and logs only on rank 0.
+
+    NEW:
+      • If latent_dim ≥ 3 and normalized latents are available, also builds a generic surface mesh
+        and saves interactive HTML, PLY, and a static PNG (logged to TB) via vis_utils.save_latent_mesh_artifacts.
+      • Pass `save_dir` at call-site (usually your tb_dir) to control where artifacts are written.
     """
     import numpy as np
     import matplotlib.pyplot as plt
@@ -252,7 +260,8 @@ def get_latent_scatter_callback(
             writer.add_figure(f"{tag_prefix}/latent_scatter3d/{subtag}_z{i}{j}{k}_view{v_idx}", fig, epoch)
             plt.close(fig)
 
-    def latent_callback(val_loader, writer, model, device, epoch, tag_prefix="AE"):
+    # NOTE: added optional save_dir arg for artifact output path
+    def latent_callback(val_loader, writer, model, device, epoch, save_dir: str | None = None, tag_prefix="AE"):
         mm = _unwrap_module(model)
         zs_raw_local, zs_hat_local = [], []
         has_norm = callable(getattr(mm, "normalize_latent", None))
@@ -272,7 +281,6 @@ def get_latent_scatter_callback(
         if mode in {"raw", "both"} and zs_raw_local:
             Z_local = torch.cat(zs_raw_local, dim=0)
             Z_all = _all_gather_variable_batch(Z_local, dim=0).cpu()
-            # Subsample on rank 0, but keep shape identical (only rank 0 will plot)
             if _is_primary():
                 Z_all = Z_all[:max_points]
             zs_raw_all = Z_all
@@ -321,6 +329,22 @@ def get_latent_scatter_callback(
             if not has_norm and _is_primary():
                 print("[LatentScatter] normalize_latent() not found; skipping 3D normalized plots.")
             _handle_block(zs_hat_all, "norm", do_3d=has_norm)
+
+            # Save interactive scatter + exact normalized coordinates (rank 0 only)
+            if _is_primary() and has_norm and zs_hat_all is not None:
+                try:
+                    save_root = save_dir if save_dir is not None else getattr(writer, "log_dir", ".")
+                    _ = save_latent_scatter_artifacts(
+                        z_norm=zs_hat_all.numpy(),            # full D saved to .npz
+                        epoch=epoch,
+                        save_root=save_root,
+                        tag_prefix=f"{tag_prefix}/latent_scatter",
+                        dims=(0, 1, 2),                      # first 3 dims for the HTML
+                        save_points=True,
+                        save_html=True,
+                    )
+                except Exception as e:
+                    print(f"[LatentScatter] scatter/points save failed: {e}")
 
     return latent_callback
 
