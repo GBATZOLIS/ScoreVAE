@@ -6,7 +6,7 @@ def get_config():
     cfg = ml_collections.ConfigDict()
     cfg.random_seed   = 42
     cfg.base_log_dir  = "./results"
-    cfg.experiment    = "analytic_manifold/flat_torus/autoencoder_iso_curv_coordconv_decoderbottleneck_noMICAE_smootherupsampling_output_linear"
+    cfg.experiment    = "analytic_manifold/flat_torus/autoencoder_iso_curv_coordconv_res_decoderbottleneck_noMICAE_smootherupsampling_output_linear"
     cfg.tensorboard_dir = f"{cfg.base_log_dir}/{cfg.experiment}/training_logs"
     cfg.checkpoint_dir  = f"{cfg.base_log_dir}/{cfg.experiment}/checkpoints"
     cfg.eval_dir        = f"{cfg.base_log_dir}/{cfg.experiment}/eval"
@@ -48,7 +48,7 @@ def get_config():
 
     # ---------------- model ----------------
     cfg.model = model = ml_collections.ConfigDict()
-    model.network         = "AutoEncoderCoordConv"   # <- classic AE + CoordConv
+    model.network         = "ResAutoEncoderCoordConv"   # <- classic AE + CoordConv
     model.in_channels     = data.channels
     model.out_channels    = data.channels
     model.image_size      = data.image_size
@@ -64,6 +64,13 @@ def get_config():
     model.use_coordconv_encoder              = False   # off by default
     model.use_coordconv_decoder_bottleneck   = True    # on at lowest-res stage
     model.use_coordconv_decoder_all_levels   = False   # off by default
+
+    #Residual configs
+    model.residual_encoder = True
+    model.residual_decoder = True
+    model.residual_scale = 0.1
+
+    #Upsampling, Output activation configs
     model.decoder_upsample_mode              = 'resize_conv'
     model.output_activation                  = 'linear'
     model.deconv_bilinear_init               = True

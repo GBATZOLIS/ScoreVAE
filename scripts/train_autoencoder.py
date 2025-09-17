@@ -577,9 +577,11 @@ def train(cfg):
                 loss, metrics = ae_loss(ae_mod, batch, cfg, device, train=True)
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(ae_mod.parameters(), cfg.optim.grad_clip)
             scaler.step(optimizer)
             scaler.update()
+
             scheduler.step()
             ema.update()
 
