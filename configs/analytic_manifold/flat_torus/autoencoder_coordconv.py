@@ -6,7 +6,7 @@ def get_config():
     cfg = ml_collections.ConfigDict()
     cfg.random_seed   = 42
     cfg.base_log_dir  = "./results"
-    cfg.experiment    = "analytic_manifold/flat_torus/autoencoder_iso_curv_coordconv_decoderbottleneck_noMICAE_smootherupsampling_output_linear"
+    cfg.experiment    = "analytic_manifold/flat_torus/autoencoder_iso_curv_orthogonal_stem"
     cfg.tensorboard_dir = f"{cfg.base_log_dir}/{cfg.experiment}/training_logs"
     cfg.checkpoint_dir  = f"{cfg.base_log_dir}/{cfg.experiment}/checkpoints"
     cfg.eval_dir        = f"{cfg.base_log_dir}/{cfg.experiment}/eval"
@@ -67,6 +67,16 @@ def get_config():
     model.decoder_upsample_mode              = 'resize_conv'
     model.output_activation                  = 'linear'
     model.deconv_bilinear_init               = True
+
+    # Geometry-friendly stem
+    model.use_orthogonal_stem   = True
+    model.stem_reflections      = 4        # 2–6 are good; 4 is a sweet spot
+    model.stem_init_alpha       = 0.0      # start ~identity (sigmoid≈0)
+
+    # Spectral norm (reduce Lipschitz/metric variation)
+    # Keep True by default, but disable while compiling unless you explicitly opt in.
+    model.use_spectral_norm             = False
+    model.use_spectral_norm_when_compiled = False  # set True only if your PT version compiles SN cleanly
 
     # VAE block — off by default (kept for compatibility)
     model.vae = ml_collections.ConfigDict()

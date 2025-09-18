@@ -1,26 +1,24 @@
 # models/autoencoder_coordconv.py
 from __future__ import annotations
 import math
-from typing import Tuple, Dict
+from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
 
 
 # ─────────────────────────── utils ─────────────────────────── #
 
 class SimpleGroupNorm2d(nn.Module):
     """
-    GroupNorm with per-channel affine, implemented so it's torch.compile-friendly.
-    Construct it via _gn_for(C, preferred_groups) to guarantee divisibility.
+    GroupNorm with per-channel affine. Construct via _gn_for to guarantee divisibility.
     """
     def __init__(self, num_groups: int, num_channels: int, eps: float = 1e-5, affine: bool = True):
         super().__init__()
         assert num_channels % num_groups == 0, "channels must be divisible by num_groups"
-        self.num_groups = num_groups
-        self.num_channels = num_channels
-        self.eps = eps
-        self.affine = affine
+        self.num_groups, self.num_channels, self.eps, self.affine = num_groups, num_channels, eps, affine
         if affine:
             self.weight = nn.Parameter(torch.ones(1, num_channels, 1, 1))
             self.bias = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
@@ -43,10 +41,7 @@ class SimpleGroupNorm2d(nn.Module):
 
 def _choose_gn_groups(C: int, preferred: int) -> int:
     """
-    Robust GN group chooser:
-    - try 'preferred' but enforce divisibility,
-    - fall back to gcd(preferred, C),
-    - ensure 1 <= groups <= C.
+    Robust GN group chooser: enforce divisibility, fallback to gcd, clamp to [1, C].
     """
     g = min(preferred, C)
     g = math.gcd(g, C)
@@ -61,8 +56,7 @@ def _gn_for(C: int, preferred_groups: int) -> SimpleGroupNorm2d:
 
 def _make_grid(H: int, W: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """
-    Build a (2, H, W) grid with x,y in [-1, 1]. Registered as buffers so it
-    travels with the module across devices; forward only casts dtype.
+    Build a (2, H, W) grid with x,y in [-1, 1].
     """
     yy, xx = torch.meshgrid(
         torch.linspace(-1.0, 1.0, H, dtype=dtype),
@@ -72,52 +66,90 @@ def _make_grid(H: int, W: int, dtype: torch.dtype = torch.float32) -> torch.Tens
     return torch.stack([xx, yy], dim=0).contiguous()
 
 
-def _bilinear_kernel_2d(k: int) -> torch.Tensor:
-    """
-    Standard 2D bilinear upsampling kernel of size k×k (float32).
-    """
-    factor = (k + 1) // 2
-    if k % 2 == 1:
-        center = factor - 1
-    else:
-        center = factor - 0.5
-    og = torch.arange(k, dtype=torch.float32)
-    filt_1d = (1 - torch.abs(og - center) / factor).clamp_min(0)
-    kernel = filt_1d.unsqueeze(0) * filt_1d.unsqueeze(1)
-    return kernel
-
-
 def init_deconv_like_bilinear(convT: nn.ConvTranspose2d):
     """
     Initialize a ConvTranspose2d (stride=2, k=4) to approximate bilinear upsampling.
-    This helps reduce checkerboard artifacts if you keep the 'deconv' path.
     """
     if not isinstance(convT, nn.ConvTranspose2d):
         return
-    k = convT.kernel_size
-    s = convT.stride
-    if isinstance(k, tuple): k = k[0]
-    if isinstance(s, tuple): s = s[0]
+    k = convT.kernel_size[0] if isinstance(convT.kernel_size, tuple) else convT.kernel_size
+    s = convT.stride[0] if isinstance(convT.stride, tuple) else convT.stride
     if k != 4 or s != 2:
-        return  # only handle the common case used below
+        return
     with torch.no_grad():
-        ker = _bilinear_kernel_2d(k)  # (4,4)
+        factor = (k + 1) // 2
+        center = factor - 1 if k % 2 == 1 else factor - 0.5
+        og = torch.arange(k, dtype=torch.float32)
+        filt_1d = (1 - torch.abs(og - center) / factor).clamp_min(0)
+        ker = filt_1d.unsqueeze(0) * filt_1d.unsqueeze(1)
         w = torch.zeros_like(convT.weight.data)
         oc, ic, _, _ = w.shape
         for i in range(oc):
-            j = i % ic
-            w[i, j, :, :] = ker
+            w[i, i % ic, :, :] = ker
         convT.weight.copy_(w)
         if convT.bias is not None:
             convT.bias.zero_()
+
+
+# ─────────────────── Orthogonal Stem Module ─────────────────── #
+
+class OrthogonalLinearPad(nn.Module):
+    """
+    Map z ∈ R^{in_d} → R^{out_d} by zero-padding then an orthogonal transform Q,
+    blended via α with the padded identity. Q is a product of Householder reflections.
+    Efficient: rank-1 updates, small fixed loop over K reflections.
+    """
+    def __init__(self, in_d: int, out_d: int, num_reflections: int = 4, init_alpha: float = 0.0):
+        super().__init__()
+        assert out_d >= in_d, "out_d must be >= in_d for zero-padding"
+        self.in_d = int(in_d)
+        self.out_d = int(out_d)
+        self.num_reflections = int(max(1, min(num_reflections, out_d)))
+
+        # Reflection parameters: (K, out_d)
+        scale = (1.0 / max(1, out_d)**0.5)
+        self.v = nn.Parameter(torch.randn(self.num_reflections, out_d) * scale)
+
+        # α = sigmoid(alpha_logit); start near 0 (identity-ish)
+        with torch.no_grad():
+            init_alpha = float(init_alpha)
+            init_alpha = min(max(init_alpha, 1e-6), 1 - 1e-6)
+            init_logit = torch.logit(torch.tensor(init_alpha))
+        self.alpha_logit = nn.Parameter(init_logit.clone())
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return torch.sigmoid(self.alpha_logit).detach()
+
+    def _apply_Q(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        Apply Q = H_K ... H_1 to y, with H(v) = I - 2 v v^T (||v||=1).
+        y: (B, out_d)
+        """
+        v_norm = F.normalize(self.v, dim=1, eps=1e-8)  # (K, out_d)
+        Qy = y
+        # small loop over K reflections; each step is a rank-1 update
+        for k in range(self.num_reflections):
+            vk = v_norm[k]                 # (out_d,)
+            proj = torch.matmul(Qy, vk)    # (B,)
+            Qy = Qy - 2.0 * proj.unsqueeze(-1) * vk.unsqueeze(0)
+        return Qy
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # 1) zero-pad to out_d (no-op if in_d==out_d)
+        y = z if self.out_d == self.in_d else F.pad(z, (0, self.out_d - self.in_d), mode="constant", value=0.0)
+        # 2) orthogonal stack
+        Qy = self._apply_Q(y)
+        # 3) blend with α∈(0,1)
+        alpha = torch.sigmoid(self.alpha_logit)
+        return y + alpha * (Qy - y)  # (1-α)·y + α·Qy
 
 
 # ─────────────────────── encoder (CoordConv) ─────────────────────── #
 
 class ConvEncoderClassicCC(nn.Module):
     """
-    Convolutional encoder with optional CoordConv on input:
-      - if use_coordconv_encoder=True, concatenates (x,y) grid to the input.
+    Convolutional encoder with optional CoordConv on input.
     """
     def __init__(
         self,
@@ -156,20 +188,25 @@ class ConvEncoderClassicCC(nn.Module):
         self.z_proj = nn.Linear(flat_dim, z_dim)
 
         if self.use_cc:
+            # register once at nominal size; rebuild on drift with correct device
             self.register_buffer("enc_grid", _make_grid(img_size, img_size), persistent=False)
 
     def _coord_grid(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
-        if (H, W) != (self.img_size, self.img_size):
-            # rare dynamic shape: rebuild on the fly and store (still a buffer)
-            self.register_buffer("enc_grid", _make_grid(H, W), persistent=False)
-        return self.enc_grid.to(dtype=x.dtype)
+        g: torch.Tensor = self.enc_grid
+        if (H, W) != g.shape[-2:]:
+            # rebuild on the SAME device as x
+            g_new = _make_grid(H, W, dtype=x.dtype).to(device=x.device)
+            self.register_buffer("enc_grid", g_new, persistent=False)
+            g = self.enc_grid
+        # ensure dtype+device match even when not rebuilt
+        return g.to(device=x.device, dtype=x.dtype)
 
     def feature(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_cc:
             N, _, H, W = x.shape
-            grid = self._coord_grid(x, H, W)  # (2,H,W), already on device
+            grid = self._coord_grid(x, H, W)  # (2,H,W)
             x = torch.cat([x, grid.unsqueeze(0).expand(N, -1, -1, -1)], dim=1)
-        y = self.net(x)  # <- (fixed indentation) always runs
+        y = self.net(x)
         return y.reshape(y.size(0), -1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -182,10 +219,11 @@ class ConvDecoderClassicCC(nn.Module):
     """
     Decoder with two upsample modes:
       - 'resize_conv' (default): bilinear upsample ×2 → 3×3 conv (smoothest)
-      - 'deconv'               : ConvTranspose2d (kept for ablations; bilinear init available)
+      - 'deconv'               : ConvTranspose2d (bilinear init available)
 
     CoordConv can be injected at the bottleneck stage and/or at all stages.
     Output head is linear by default (avoid sigmoid saturation for geometry regs).
+    Optional orthogonal stem and spectral_norm on selected convs.
     """
     def __init__(
         self,
@@ -200,6 +238,10 @@ class ConvDecoderClassicCC(nn.Module):
         upsample_mode: str = "resize_conv",    # 'resize_conv' | 'deconv'
         output_activation: str = "linear",     # 'linear' | 'tanh' | 'sigmoid'
         deconv_bilinear_init: bool = True,
+        use_orthogonal_stem: bool = True,
+        stem_reflections: int = 4,
+        stem_init_alpha: float = 0.0,
+        use_spectral_norm: bool = True,
     ):
         super().__init__()
         assert upsample_mode in ("resize_conv", "deconv")
@@ -211,18 +253,19 @@ class ConvDecoderClassicCC(nn.Module):
         self.upsample_mode = upsample_mode
         self.output_activation = output_activation
         self.deconv_bilinear_init = deconv_bilinear_init
+        self.use_spectral_norm = use_spectral_norm
 
         chs = [base, base * 2, base * 4][:levels]
         s = max(1, img_size // (2 ** levels))
         self.spatial = s
         self.stem_ch = chs[-1]
+        stem_dim = self.stem_ch * s * s
 
-        self.fc = nn.Linear(z_dim, self.stem_ch * s * s)
-
-        # stage grids as buffers: size after the *first* upsample in each stage
-        for i in range(levels):
-            Hs = s * (2 ** (i + 1))
-            self.register_buffer(f"grid_stage_{i}", _make_grid(Hs, Hs), persistent=False)
+        # Stem: orthogonal (Householder) or plain linear
+        if use_orthogonal_stem:
+            self.stem = OrthogonalLinearPad(z_dim, stem_dim, stem_reflections, stem_init_alpha)
+        else:
+            self.stem = nn.Linear(z_dim, stem_dim)
 
         self.up_blocks = nn.ModuleList()
         self.conv2s = nn.ModuleList()
@@ -233,7 +276,7 @@ class ConvDecoderClassicCC(nn.Module):
         outs = list(reversed(chs[:-1])) + [chs[0]]
 
         for stage_idx, next_ch in enumerate(outs):
-            # First half: upsample
+            # Upsample half
             if self.upsample_mode == "resize_conv":
                 up = nn.Sequential(
                     nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
@@ -241,7 +284,7 @@ class ConvDecoderClassicCC(nn.Module):
                     _gn_for(next_ch, groups_gn),
                     nn.SiLU(),
                 )
-            else:  # 'deconv'
+            else:
                 up = nn.Sequential(
                     nn.ConvTranspose2d(prev_ch, next_ch, kernel_size=4, stride=2, padding=1),
                     _gn_for(next_ch, groups_gn),
@@ -249,34 +292,55 @@ class ConvDecoderClassicCC(nn.Module):
                 )
             self.up_blocks.append(up)
 
-            # Second half: optional CoordConv then 3×3 conv
+            # Second half: optional CoordConv then 3×3 conv (+ optional SN)
             inject = (self.use_cc_all or (stage_idx == 0 and self.use_cc_bot))
             conv_in = next_ch + (2 if inject else 0)
-            self.conv2s.append(nn.Conv2d(conv_in, next_ch, kernel_size=3, padding=1))
+            conv2 = nn.Conv2d(conv_in, next_ch, kernel_size=3, padding=1)
+            if self.use_spectral_norm:
+                conv2 = spectral_norm(conv2, n_power_iterations=1)
+            self.conv2s.append(conv2)
             self.norm2s.append(_gn_for(next_ch, groups_gn))
             self.act2s.append(nn.SiLU())
 
+            # Stage grid buffer (after the *first* upsample in this stage)
+            Hs = s * (2 ** (stage_idx + 1))
+            self.register_buffer(f"grid_stage_{stage_idx}", _make_grid(Hs, Hs), persistent=False)
+
             prev_ch = next_ch
 
-        self.out = nn.Conv2d(chs[0], out_ch, kernel_size=3, padding=1)
+        out_conv = nn.Conv2d(chs[0], out_ch, kernel_size=3, padding=1)
+        self.out = spectral_norm(out_conv, n_power_iterations=1) if self.use_spectral_norm else out_conv
 
-        # Optional: make deconvs approximate bilinear upsampling at init
+        # Optional: initialize deconvs to bilinear
         if self.upsample_mode == "deconv" and self.deconv_bilinear_init:
             for m in self.up_blocks.modules():
                 if isinstance(m, nn.ConvTranspose2d):
                     init_deconv_like_bilinear(m)
 
-    def _stage_grid(self, i: int, dtype: torch.dtype, H: int, W: int) -> torch.Tensor:
+        # Initialize convs orthogonally, zero biases
+        self.apply(self._init_conv_orthogonal)
+
+    @staticmethod
+    def _init_conv_orthogonal(m: nn.Module):
+        if isinstance(m, nn.Conv2d):
+            try:
+                nn.init.orthogonal_(m.weight)
+            except Exception:
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def _stage_grid(self, i: int, dtype: torch.dtype, device: torch.device, H: int, W: int) -> torch.Tensor:
         g: torch.Tensor = getattr(self, f"grid_stage_{i}")
         if g.shape[-2:] != (H, W):
-            # very rare: shape drift — rebuild and replace buffer
-            self.register_buffer(f"grid_stage_{i}", _make_grid(H, W), persistent=False)
+            g_new = _make_grid(H, W, dtype=dtype).to(device=device)
+            self.register_buffer(f"grid_stage_{i}", g_new, persistent=False)
             g = getattr(self, f"grid_stage_{i}")
-        return g.to(dtype=dtype)
+        return g.to(device=device, dtype=dtype)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         B = z.size(0)
-        h = self.fc(z).reshape(B, self.stem_ch, self.spatial, self.spatial)
+        h = self.stem(z).reshape(B, self.stem_ch, self.spatial, self.spatial)
 
         for i in range(self.levels):
             # upsample block
@@ -286,7 +350,7 @@ class ConvDecoderClassicCC(nn.Module):
             inject = (self.use_cc_all or (i == 0 and self.use_cc_bot))
             if inject:
                 Hs, Ws = h.shape[-2:]
-                grid = self._stage_grid(i, h.dtype, Hs, Ws)  # (2,Hs,Ws)
+                grid = self._stage_grid(i, dtype=h.dtype, device=h.device, H=Hs, W=Ws)  # (2, Hs, Ws)
                 h = torch.cat([h, grid.unsqueeze(0).expand(B, -1, -1, -1)], dim=1)
 
             # 3×3 + GN + SiLU
@@ -313,6 +377,7 @@ class AutoEncoderCoordConv(nn.Module):
       • Decoder: CoordConv at bottleneck and/or all stages
       • Upsample: 'resize_conv' (default) or 'deconv'
       • Output: linear (default), tanh, or sigmoid
+      • Orthogonal stem and optional spectral norm for geometric stability
     """
     def __init__(self, cfg):
         super().__init__()
@@ -334,6 +399,16 @@ class AutoEncoderCoordConv(nn.Module):
         out_act = str(getattr(m, "output_activation", "linear"))
         deconv_bilin_init = bool(getattr(m, "deconv_bilinear_init", True))
 
+        # geometry-friendly stem + SN (disable SN if compiling, unless you know it’s fine)
+        compile_flag = bool(getattr(m, "compile", False))
+        use_orthogonal_stem = bool(getattr(m, "use_orthogonal_stem", True))
+        stem_reflections = int(getattr(m, "stem_reflections", 4))
+        stem_init_alpha = float(getattr(m, "stem_init_alpha", 0.0))
+        use_spectral_norm = bool(getattr(m, "use_spectral_norm", True))
+        if compile_flag:
+            # some PT versions have compile slowdowns with spectral_norm reparam
+            use_spectral_norm = bool(getattr(m, "use_spectral_norm_when_compiled", False))
+
         self.encoder = ConvEncoderClassicCC(
             in_ch=in_ch, z_dim=z_dim, base=base, levels=levels, img_size=img_size,
             groups_gn=groups_gn, use_coordconv_encoder=use_cc_enc,
@@ -343,6 +418,9 @@ class AutoEncoderCoordConv(nn.Module):
             groups_gn=groups_gn, use_cc_bot=use_cc_bot, use_cc_all=use_cc_all,
             upsample_mode=upsample_mode, output_activation=out_act,
             deconv_bilinear_init=deconv_bilin_init,
+            use_orthogonal_stem=use_orthogonal_stem,
+            stem_reflections=stem_reflections, stem_init_alpha=stem_init_alpha,
+            use_spectral_norm=use_spectral_norm,
         )
 
         # latent norm buffers for your callbacks
