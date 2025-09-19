@@ -31,7 +31,7 @@ def get_config():
     model.dropout    = 0.0
     model.compile    = False
     model.ema_decay  = 0.999
-    model.checkpoint = None #"LatentDiffPost_last_EMA.pth"
+    model.checkpoint = 'LatentDiff_epoch_49_loss_0.001.pth'
 
     # ---------------- Optimizer / Scheduler (total_steps is injected by the driver) ----------------
     cfg.optim = opt = ml_collections.ConfigDict()

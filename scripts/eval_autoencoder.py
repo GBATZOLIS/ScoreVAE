@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import TensorDataset, DataLoader  # ← add
 
 from configs import load_config
-from data.data_utils_fast import get_dataloaders
+from data.data_utils_ddp import get_dataloaders
 from models import get_model
 from utils.train_utils import prepare_training_dirs, EMA, load_model
 from utils.ae_utils import (
@@ -479,7 +479,7 @@ def eval_autoencoder(
                 post_denoise_fn=None,
                 endpoint_mode=str(geo.get("endpoint_mode", "clean")),
                 fixed_noise=None,  # relevant only if endpoint_mode=="noisy"
-                init_nseeds=5,
+                init_nseeds=20,
             )
 
             # ── FIX: realized frames are number of path knots, not batch size
@@ -544,33 +544,48 @@ def eval_autoencoder(
                 tag="LatentGeodesics/DecodedGrid",
                 filename="latent_geodesics_grid.png",
             )
-
+            
             # ── GT comparison and RMSE
             avg_rmse = None
             try:
                 if hasattr(base_ds, "compute_geodesic"):
-                    # ── FIX: exact same number of frames as estimated path
-                    T = int(len(path_z))  # not path_z[0].shape[0]
-                    t_lin = torch.linspace(0.0, 1.0, T)
+                    # Consistent naming avoids accidental reuse
+                    B_pairs = int(B)
+                    T_frames = int(len(path_z_denorm))  # realized frames = n_segments + 1
 
-                    # endpoints in the dataset's parameterization (match the very same images)
-                    P = Rsel[:B].detach().cpu()
-                    Q = Rsel[B:2 * B].detach().cpu()
-
-                    # ── FIX: build per-pair trajectories correctly and decode
-                    # path_z_denorm is a list of length T; each item is (B, D)
-                    pred_imgs = []  # list of (T, C, H, W)
-                    for b in range(B):
-                        z_traj_b = torch.stack([path_z_denorm[k][b] for k in range(T)], dim=0).to(device)  # (T,D)
+                    # 1) Decode predicted trajectories first  → pred_stack: (B, T, C, H, W)
+                    pred_imgs = []
+                    for b in range(B_pairs):
+                        z_traj_b = torch.stack([path_z_denorm[k][b] for k in range(T_frames)], dim=0).to(device)  # (T, D)
                         with torch.no_grad():
-                            dec_b = model.decode(z_traj_b)  # (T,C,H,W)
+                            dec_b = model.decode(z_traj_b)  # (T, C, H, W)
                         pred_imgs.append(dec_b.detach().cpu().clamp(0.0, 1.0))
                     pred_stack = torch.stack(pred_imgs, dim=0)  # (B, T, C, H, W)
 
-                    # GT frames with the SAME endpoints (P,Q) and SAME T
+                    # 2) Build the GT timeline with the SAME number of frames
+                    t_lin = torch.linspace(0.0, 1.0, T_frames)
+
+                    # Endpoints (dataset parameters) for the same pairs you decoded
+                    P = Rsel[:B_pairs].detach().cpu()
+                    Q = Rsel[B_pairs:2 * B_pairs].detach().cpu()
+
+                    # 3) Compute ground-truth frames with the SAME B and T
                     gt_stack = base_ds.compute_geodesic(P, Q, t_lin).detach().cpu()  # (B, T, C, H, W)
 
-                    # RMSE per pair, then average
+                    print(f'pred_stack.size():{pred_stack.size()}')
+                    print(f'gt_stack.size():{gt_stack.size()}')
+
+                    # 4) Sanity checks before subtraction (fail fast if anything drifts)
+                    assert gt_stack.shape[0] == pred_stack.shape[0], \
+                        f"B mismatch: pred {pred_stack.shape[0]} vs gt {gt_stack.shape[0]}"
+                    assert gt_stack.shape[1] == pred_stack.shape[1], \
+                        f"T mismatch: pred {pred_stack.shape[1]} vs gt {gt_stack.shape[1]}"
+                    assert gt_stack.shape[2:] == pred_stack.shape[2:], \
+                        f"CHW mismatch: pred {pred_stack.shape[2:]} vs gt {gt_stack.shape[2:]}"
+
+                    
+
+                    # 5) RMSE per pair, then average
                     mse_per_pair = ((pred_stack - gt_stack) ** 2).mean(dim=(1, 2, 3, 4))
                     rmse_per_pair = torch.sqrt(mse_per_pair)
                     avg_rmse = rmse_per_pair.mean().item()
@@ -578,11 +593,11 @@ def eval_autoencoder(
                     writer.add_scalar("LatentGeodesics/AvgRMSE_vs_GT", float(avg_rmse), epoch)
                     txt_path = os.path.join(eval_dir, "geodesic_eval.txt")
                     with open(txt_path, "w") as f:
-                        f.write(f"Avg RMSE vs GT (B={B}, T={T}): {avg_rmse:.6f}\n")
-                    print(f"[Geodesics][GT] Avg RMSE vs ground-truth (B={B}, T={T}): {avg_rmse:.6f}")
+                        f.write(f"Avg RMSE vs GT (B={B_pairs}, T={T_frames}): {avg_rmse:.6f}\n")
+                    print(f"[Geodesics][GT] Avg RMSE vs ground-truth (B={B_pairs}, T={T_frames}): {avg_rmse:.6f}")
                     print(f"[Geodesics][GT] Saved → {txt_path}")
 
-                    # visual comparison (top: estimated, bottom: GT) per pair
+                    # side-by-side visual
                     comp_path = os.path.join(eval_dir, "latent_geodesics_vs_gt.png")
                     _save_geodesic_comparison_grid(
                         pred_stack=pred_stack, gt_stack=gt_stack, out_path=comp_path,
@@ -591,17 +606,24 @@ def eval_autoencoder(
                     print(f"[Geodesics][GT] Comparison image saved → {comp_path}")
 
                     # stash into info (optional)
-                    try:
-                        if isinstance(info, dict):
-                            info["avg_rmse_vs_gt"] = float(avg_rmse)
-                            info["geodesic_T"] = int(T)
-                    except Exception:
-                        pass
+                    if isinstance(info, dict):
+                        info["avg_rmse_vs_gt"] = float(avg_rmse)
+                        info["geodesic_T"] = int(T_frames)
 
                 else:
                     print("[Geodesics][GT] Dataset does not expose 'compute_geodesic' — skipping GT evaluation.")
             except Exception as e:
+                # helpful dump if anything ever goes wrong again
                 print(f"[Geodesics][GT] Failed to evaluate GT deviation: {e}")
+                try:
+                    print("[Geodesics][GT][debug]",
+                        "B_pairs:", B_pairs if 'B_pairs' in locals() else None,
+                        "T_frames:", T_frames if 'T_frames' in locals() else None,
+                        "pred_stack:", tuple(pred_stack.shape) if 'pred_stack' in locals() else None)
+                except Exception:
+                    pass
+
+
 
             # persist the latent path & loss info (for later analysis)
             os.makedirs(eval_dir, exist_ok=True)

@@ -54,13 +54,20 @@ def _slerp(n0: torch.Tensor, n1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     """
     n0 = F.normalize(n0, dim=-1)
     n1 = F.normalize(n1, dim=-1)
+
     dot = (n0 * n1).sum(-1, keepdim=True).clamp(-1.0, 1.0)  # (B,1)
-    theta = torch.acos(dot)                                  # (B,1)
+    theta = torch.acos(dot).squeeze(-1)                      # (B,)
     eps = 1e-8
-    sin_th = torch.sin(theta).clamp_min(eps)
+    sin_th = torch.sin(theta).clamp_min(eps)                 # (B,)
+
+    # reshape to broadcast with tt = (1,T,1)
+    theta  = theta.view(-1, 1, 1)                            # (B,1,1)
+    sin_th = sin_th.view(-1, 1, 1)                           # (B,1,1)
     tt = t.view(1, -1, 1)                                    # (1,T,1)
-    A = torch.sin((1 - tt) * theta) / sin_th                 # (B,T,1)
+
+    A  = torch.sin((1 - tt) * theta) / sin_th                # (B,T,1)
     Bc = torch.sin(tt * theta) / sin_th                      # (B,T,1)
+
     return A * n0.unsqueeze(1) + Bc * n1.unsqueeze(1)        # (B,T,3)
 
 
