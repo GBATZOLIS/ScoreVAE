@@ -6,7 +6,7 @@ def get_config():
     cfg = ml_collections.ConfigDict()
     cfg.random_seed   = 42
     cfg.base_log_dir  = "./results"
-    cfg.experiment    = "analytic_manifold/sphere/autoencoder_iso_metric_smoothness_MECAE"
+    cfg.experiment    = "analytic_manifold/sphere/improved_architecture/autoencoder"
     cfg.tensorboard_dir = f"{cfg.base_log_dir}/{cfg.experiment}/training_logs"
     cfg.checkpoint_dir  = f"{cfg.base_log_dir}/{cfg.experiment}/checkpoints"
     cfg.eval_dir        = f"{cfg.base_log_dir}/{cfg.experiment}/eval"
@@ -58,7 +58,7 @@ def get_config():
     model.groups_gn       = 8
     model.ema_decay       = 0.999
     model.compile         = True
-    model.checkpoint      = 'AE_epoch_49_loss_0.001.pth'
+    model.checkpoint      = 'AE_epoch_9_loss_0.002.pth'
     # CoordConv toggles
     model.use_coordconv_encoder              = False   # off by default
     model.use_coordconv_decoder_bottleneck   = True    # on at lowest-res stage
@@ -159,7 +159,7 @@ def get_config():
     lat.metric_type      = "jacobian"
     lat.lam_metric       = 1e-3
     lat.t_value          = 0.05
-    lat.diffusion_config = "configs/analytic_manifold/sphere/latent_config.py"
+    lat.diffusion_config = "configs/analytic_manifold/sphere/improved_architecture/latent_config.py"
     lat.cg = ml_collections.ConfigDict()
     lat.cg.max_iter              = 5
     lat.cg.tol                   = 1e-6
