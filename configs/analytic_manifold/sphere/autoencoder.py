@@ -6,7 +6,7 @@ def get_config():
     cfg = ml_collections.ConfigDict()
     cfg.random_seed   = 42
     cfg.base_log_dir  = "./results"
-    cfg.experiment    = "analytic_manifold/sphere/autoencoder"
+    cfg.experiment    = "analytic_manifold/sphere/autoencoder_iso_metric_smoothness_MECAE"
     cfg.tensorboard_dir = f"{cfg.base_log_dir}/{cfg.experiment}/training_logs"
     cfg.checkpoint_dir  = f"{cfg.base_log_dir}/{cfg.experiment}/checkpoints"
     cfg.eval_dir        = f"{cfg.base_log_dir}/{cfg.experiment}/eval"
@@ -48,17 +48,40 @@ def get_config():
 
     # ---------------- model ----------------
     cfg.model = model = ml_collections.ConfigDict()
-    model.network         = "AutoEncoder"
+    model.network         = "AutoEncoderCoordConv"   # <- classic AE + CoordConv
     model.in_channels     = data.channels
     model.out_channels    = data.channels
     model.image_size      = data.image_size
-    model.latent_dim      = 2          # keep 2-D latent to match intrinsic dim
+    model.latent_dim      = 3
     model.base_channels   = 32
     model.num_down_levels = 3
+    model.groups_gn       = 8
     model.ema_decay       = 0.999
     model.compile         = True
     model.checkpoint      = None
-
+    # CoordConv toggles
+    model.use_coordconv_encoder              = False   # off by default
+    model.use_coordconv_decoder_bottleneck   = True    # on at lowest-res stage
+    model.use_coordconv_decoder_all_levels   = False   # off by default
+    model.decoder_upsample_mode              = 'resize_conv'
+    model.output_activation                  = 'linear'
+    model.deconv_bilinear_init               = True
+    # Enable Fourier features and set recommended defaults
+    model.use_fourier_features = True
+    model.fourier_num_freqs = 6       # More bands give more capacity for detail. 6-10 is a good range.
+    model.fourier_max_freq_log2 = 5   # Max freq of 2^6=64. For 32px images, this captures super-pixel frequencies.
+    model.fourier_include_self = True # Always recommended to keep the base [-1, 1] coordinates.
+    # Geometry-friendly stem
+    model.use_orthogonal_stem   = False
+    model.stem_reflections      = 4        # 2–6 are good; 4 is a sweet spot
+    model.stem_init_alpha       = 0.1      # start ~identity (sigmoid≈0)
+    # Spectral norm (reduce Lipschitz/metric variation)
+    # Keep True by default, but disable while compiling unless you explicitly opt in.
+    model.use_spectral_norm             = False
+    model.use_spectral_norm_when_compiled = False  # set True only if your PT version compiles SN cleanly
+    #Encoder antialiasing parameters
+    model.encoder_downsample_mode = "avg"
+    model.encoder_blur_filt_size  = 5
     # VAE block — off by default (kept for compatibility)
     model.vae = ml_collections.ConfigDict()
     model.vae.enabled = False
@@ -69,12 +92,15 @@ def get_config():
     loss.beta_kl          = 1e-3
 
     # local isometry regs
-    loss.enc_iso_weight   = 0.0 #0.04
-    loss.dec_iso_weight   = 0.0 #0.04
+    loss.enc_iso_weight   = 5e-3 #0.04
+    loss.dec_iso_weight   = 5e-3 #0.04
     loss.num_v            = 1
 
+    
+
+
     # --- MECAE (extrinsic) ---
-    loss.curvature_weight = 0.1
+    loss.curvature_weight = 4e-4
     loss.curvature = curv = ml_collections.ConfigDict()
     curv.mode              = "mecae"
     curv.target            = "both"        # "encoder" | "decoder" | "both"
@@ -87,6 +113,18 @@ def get_config():
     curv.fd_eps            = 1e-3
     curv.B_curv            = 128
     curv.every_n_steps     = 3
+
+    # --- Metric Smoothness (decoder pullback metric invariants) ---
+    loss.metric_smooth_weight = 1e-3   # start small; 1e-4–3e-3 typical
+    loss.metric_smoothness = ms = ml_collections.ConfigDict()
+    ms.K_w               = 1           # 1–2; raise to 2 if logs look noisy
+    ms.use_rademacher    = True
+    ms.use_exact_hessian = True        # nested JVPs; set False to use FD fallback
+    ms.fd_eps            = 1e-3
+    ms.normalize_by_dim  = True        # scale-free across latent dims
+    ms.target            = "encoder"   # "encoder" | "decoder" | "both"
+    ms.B_curv            = curv.B_curv # reuse same sub-batch size
+    ms.every_n_steps     = curv.every_n_steps  # same cadence as MECAE
 
     # --- MICAE (intrinsic via Gauss) ---
     loss.intrinsic_weight  = 0.0

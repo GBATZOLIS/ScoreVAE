@@ -6,7 +6,7 @@ def get_config():
     cfg = ml_collections.ConfigDict()
     cfg.random_seed   = 42
     cfg.base_log_dir  = "./results"
-    cfg.experiment    = "analytic_manifold/flat_torus/autoencoder_iso_curv_orthogonal_stem"
+    cfg.experiment    = "analytic_manifold/flat_torus/encoder_antialias_new_initialisation_fourier_features"
     cfg.tensorboard_dir = f"{cfg.base_log_dir}/{cfg.experiment}/training_logs"
     cfg.checkpoint_dir  = f"{cfg.base_log_dir}/{cfg.experiment}/checkpoints"
     cfg.eval_dir        = f"{cfg.base_log_dir}/{cfg.experiment}/eval"
@@ -68,15 +68,25 @@ def get_config():
     model.output_activation                  = 'linear'
     model.deconv_bilinear_init               = True
 
+    # Enable Fourier features and set recommended defaults
+    model.use_fourier_features = True
+    model.fourier_num_freqs = 6       # More bands give more capacity for detail. 6-10 is a good range.
+    model.fourier_max_freq_log2 = 5   # Max freq of 2^6=64. For 32px images, this captures super-pixel frequencies.
+    model.fourier_include_self = True # Always recommended to keep the base [-1, 1] coordinates.
+
     # Geometry-friendly stem
-    model.use_orthogonal_stem   = True
+    model.use_orthogonal_stem   = False
     model.stem_reflections      = 4        # 2–6 are good; 4 is a sweet spot
-    model.stem_init_alpha       = 0.0      # start ~identity (sigmoid≈0)
+    model.stem_init_alpha       = 0.1      # start ~identity (sigmoid≈0)
 
     # Spectral norm (reduce Lipschitz/metric variation)
     # Keep True by default, but disable while compiling unless you explicitly opt in.
     model.use_spectral_norm             = False
     model.use_spectral_norm_when_compiled = False  # set True only if your PT version compiles SN cleanly
+
+    #Encoder antialiasing parameters
+    model.encoder_downsample_mode = "avg"
+    model.encoder_blur_filt_size  = 5
 
     # VAE block — off by default (kept for compatibility)
     model.vae = ml_collections.ConfigDict()

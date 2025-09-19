@@ -52,6 +52,20 @@ def _solve_upper_tri_batch(U: Tensor, B_: Tensor) -> Tensor:
         X, _ = torch.triangular_solve(B_, U, upper=True)
     return X.squeeze(-1) if add_dim else X
 
+def _solve_lower_tri_batch(L: Tensor, B_: Tensor) -> Tensor:
+    """
+    Solve L X = B with L lower-triangular.
+      L: (B,d,d), B: (B,d) or (B,d,k)
+    """
+    add_dim = (B_.dim() == 2)
+    if add_dim:
+        B_ = B_.unsqueeze(-1)
+    try:
+        X = torch.linalg.solve_triangular(L, B_, upper=False)
+    except AttributeError:
+        X, _ = torch.triangular_solve(B_, L, upper=False)
+    return X.squeeze(-1) if add_dim else X
+
 def _sample_rademacher(shape, device, dtype):
     return (torch.randint(0, 2, shape, device=device) * 2 - 1).to(dtype)
 
@@ -503,3 +517,94 @@ def micae_intrinsic_decoder(
         out.update({"J": J, "G": G, "L": L})
     return out
 
+# ====================================================================================
+# Metric Smoothness (invariant): || L^{-1} (∂_w G) L^{-T} ||_F^2
+# ====================================================================================
+
+def metric_smoothness_decoder_Ginv_fast(
+    *,
+    decode: Callable[[Tensor], Tensor],
+    z: Tensor,                 # (B, m)
+    K_w: int = 1,              # # of latent directions w (also used for # of Hutchinson probes s)
+    use_rademacher: bool = True,
+    use_exact_hessian: bool = True,
+    fd_eps: float = 1e-3,
+    JGL: Optional[Tuple[Tensor, Tensor, Tensor]] = None,   # (J, G, L) reuse from MECAE if available
+    normalize_by_dim: bool = True,
+) -> Dict[str, Tensor]:
+    """
+    Invariant metric smoothness without column loops:
+
+      MSM_G(z) = E_w || L^{-1} dG[w] L^{-T} ||_F^2,
+      G = J^T J,  L = chol(G).
+
+    Hutchinson with probe s: ||L^{-1} dG[w] L^{-T}||_F^2
+      = E_s || L^{-1} dG[w] y ||_2^2,  where y = L^{-T} s.
+
+    Using contractions (no 3-tensor build, no per-column loop):
+      dG[w] y = (dJ[w])^T (J y) + J^T (dJ[w] y)
+              = jvp(grad⟨a, f⟩, (z, w)) + J^T D^2 f[z][y, w],  with a = J y (treated as constant).
+    """
+    assert z.dim() == 2, "z must be (B, m)"
+    dev, dt = z.device, z.dtype
+    B, m = z.shape
+
+    # Build or reuse J, G, L (use tiny lam=0 for MSM; pass your lam if you prefer)
+    if JGL is None:
+        J, G, L = _build_J_and_G_batched(decode, z, lam=0.0)  # J:(B,D,m), L:(B,m,m)
+    else:
+        J, G, L = JGL
+
+    # Wrap decode so torch.func.* works with (m,) -> (D,) signatures
+    f_single = _as_single_map(decode)
+
+    # Sample latent directions W and Hutchinson probes S OUTSIDE any vmap
+    if use_rademacher:
+        W = (torch.randint(0, 2, (K_w, B, m), device=dev) * 2 - 1).to(dt)  # (K_w, B, m)
+        S = (torch.randint(0, 2, (K_w, B, m), device=dev) * 2 - 1).to(dt)  # (K_w, B, m)
+    else:
+        W = torch.randn(K_w, B, m, device=dev, dtype=dt)
+        S = torch.randn(K_w, B, m, device=dev, dtype=dt)
+
+    # One Hutchinson sample for a pair (w_row, s_row) — NO randomness inside.
+    def _one_sample(w_row: Tensor, s_row: Tensor) -> Tensor:
+        # y = L^{-T} s
+        y = _solve_upper_tri_batch(L.transpose(1, 2), s_row)  # (B, m)
+
+        # a = J y (treat 'a' as constant in the next grad/JVP)
+        a = torch.einsum('bdm,bm->bd', J, y)  # (B, D)
+
+        # b = D^2 f[z][y, w] via two JVPs (exact) or a tiny FD fallback
+        if use_exact_hessian:
+            b = _H_mixed_exact_batched(f_single, z, y, w_row)  # (B, D)
+        else:
+            b = _H_mixed_fd_batched(f_single, z, y, w_row, fd_eps)  # (B, D)
+
+        # c = (dJ[w])^T a = jvp( grad⟨a, f⟩, (z, w) )
+        def c_single(zi: Tensor, ai: Tensor, wi: Tensor) -> Tensor:
+            def g_local(zz: Tensor) -> Tensor:
+                # 'ai' captured as a CONSTANT here — do NOT differentiate through 'a'
+                return (ai * f_single(zz)).sum()
+            grad_g = grad(g_local)
+            return jvp(grad_g, (zi,), (wi,))[1]  # (m,)
+        c = vmap(c_single)(z, a, w_row)  # (B, m)
+
+        # J^T b
+        JT_b = torch.einsum('bmd,bd->bm', J.transpose(1, 2), b)  # (B, m)
+
+        # dG[w] y
+        dGy = c + JT_b  # (B, m)
+
+        # u = L^{-1} dG[w] y
+        u = torch.linalg.solve_triangular(L, dGy.unsqueeze(-1), upper=False).squeeze(-1)  # (B, m)
+
+        # ||u||^2 (per sample in batch)
+        return (u * u).sum(dim=-1)  # (B,)
+
+    # Expectation over K_w pairs (w, s). If you prefer independent K_s, duplicate S sampling accordingly.
+    vals = vmap(_one_sample, in_dims=(0, 0), out_dims=0)(W, S)  # (K_w, B)
+    msm = vals.mean(dim=0)  # (B,)
+    if normalize_by_dim:
+        msm = msm / (m * m)
+
+    return {"MSM_G": msm}

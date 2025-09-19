@@ -12,16 +12,20 @@ try:
 except Exception:
     dynamo = None
 
-from .isometry import encoder_isometry_regularisation, decoder_isometry_regularisation
-from .curvature import mecae_extrinsic_decoder, micae_intrinsic_decoder
+from .isometry import (
+    encoder_isometry_regularisation,
+    decoder_isometry_regularisation,
+)
+from .curvature import (
+    mecae_extrinsic_decoder,
+    micae_intrinsic_decoder,
+    metric_smoothness_decoder_Ginv_fast,  # <-- direct import
+)
 
 
 @contextmanager
 def freeze_params(module: Optional[nn.Module]):
-    """
-    Temporarily sets a module to eval and disables gradients on its params.
-    Restores mode and requires_grad flags after the block.
-    """
+    """Temporarily sets a module to eval and disables gradients on its params."""
     if module is None:
         yield
         return
@@ -39,10 +43,7 @@ def freeze_params(module: Optional[nn.Module]):
 
 
 def _guess_decoder_module(model: nn.Module) -> Optional[nn.Module]:
-    """
-    Best-effort to guess a submodule corresponding to the decoder block,
-    used only to freeze during curvature targeting the encoder.
-    """
+    """Best-effort to guess a decoder submodule (used to freeze when targeting encoder)."""
     for name in ["decoder", "dec", "decode_net", "generator", "g", "dec_block", "decode_block", "decoder_net"]:
         if hasattr(model, name):
             mod = getattr(model, name)
@@ -70,8 +71,8 @@ def ae_loss(
     train: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, Optional[float]]]:
     """
-    Autoencoder loss with optional isometry + MECAE (extrinsic) + MICAE (intrinsic).
-    DDP-safe: operates on the local batch; DDP will reduce grads as usual.
+    Autoencoder loss with optional isometry + MECAE (extrinsic) + MICAE (intrinsic) +
+    Metric Smoothness (invariant, G^{-1}-normalised).
     """
     x = batch[0].to(device)
 
@@ -110,31 +111,38 @@ def ae_loss(
 
     total = rec + beta_kl * kl + enc_iso_w * enc_iso + dec_iso_w * dec_iso
 
-    # ---- curvature regs ----
-    me_iter_val: Optional[float] = None   # MECAE EEC
-    mi_iter_val: Optional[float] = None   # MICAE EIC
+    # ---- curvature regs (MECAE / MICAE) ----
+    me_iter_val: Optional[float] = None
+    mi_iter_val: Optional[float] = None
+    ms_iter_val: Optional[float] = None  # metric smoothness
 
     metrics: Dict[str, Optional[float]] = {}
 
-    curv_w = float(getattr(cfg.loss, "curvature_weight", 0.0))  # MECAE weight
-    intr_w = float(getattr(cfg.loss, "intrinsic_weight", 0.0))  # MICAE weight
+    curv_w = float(getattr(cfg.loss, "curvature_weight", 0.0))
+    intr_w = float(getattr(cfg.loss, "intrinsic_weight", 0.0))
+    ms_w   = float(getattr(cfg.loss, "metric_smooth_weight", 0.0))
 
-    # use a per-model step counter to gate curvature frequency
+    # per-step schedule gate
     step_attr = "_curv_step"
     step = getattr(model, step_attr, 0)
 
     curv_cfg = getattr(cfg.loss, "curvature", {}) or {}
     intr_cfg = getattr(cfg.loss, "intrinsic", {}) or {}
+    ms_cfg   = getattr(cfg.loss, "metric_smoothness", {}) or {}
 
-    # schedule
-    every_n  = int(getattr(curv_cfg, "every_n_steps", 1))
-    do_curv  = train and (every_n <= 1 or (step % max(every_n, 1) == 0))
-    intr_every = int(getattr(intr_cfg, "every_n_steps", every_n))
-    do_intr = train and (intr_every <= 1 or (step % max(intr_every, 1) == 0))
+    every_n     = int(getattr(curv_cfg, "every_n_steps", 1))
+    do_curv     = train and (curv_w > 0.0) and (every_n <= 1 or (step % max(every_n, 1) == 0))
 
-    # target & freeze policy (shared)
+    intr_every  = int(getattr(intr_cfg, "every_n_steps", every_n))
+    do_intr     = train and (intr_w > 0.0) and (intr_every <= 1 or (step % max(intr_every, 1) == 0))
+
+    ms_every    = int(getattr(ms_cfg, "every_n_steps", every_n))
+    do_ms       = train and (ms_w > 0.0) and (ms_every <= 1 or (step % max(ms_every, 1) == 0))
+
+    # shared target & freeze policy
     target   = str(getattr(curv_cfg, "target", "encoder")).lower()
     z_full32 = model.encode(x).to(torch.float32)
+
     if target == "encoder":
         dec_mod  = _guess_decoder_module(model)
         freeze_ctx = freeze_params(dec_mod)
@@ -146,26 +154,27 @@ def ae_loss(
         freeze_ctx = nullcontext()
         z_in = z_full32.detach()
 
-    # sub-batch for curvature (memory-friendly)
+    # sub-batch for heavy geometry terms
     B = z_in.size(0)
     B_curv = int(getattr(curv_cfg, "B_curv", 8))
     B_curv = max(1, min(B_curv, B))
-    idx = torch.randperm(B, device=z_in.device)[:B_curv] if (B_curv < B) else torch.arange(B, device=z_in.device)
+    idx = torch.randperm(B, device=z_in.device)[:B_curv] if (B_curv < B) \
+        else torch.arange(B, device=z_in.device)
     z_curv = z_in[idx]
 
-    if (curv_w > 0.0 or intr_w > 0.0) and (do_curv or do_intr):
+    # run geometry terms (no autocast)
+    if (do_curv or do_intr or do_ms):
         if dynamo is not None:
             try:
                 dynamo.graph_break()
             except Exception:
                 pass
 
-        # Compute curvature in full precision for stability
         with torch.amp.autocast("cuda", enabled=False), freeze_ctx:
             JGL = None
 
             # ---- MECAE (extrinsic) ----
-            if curv_w > 0.0 and do_curv:
+            if do_curv:
                 me_out = mecae_extrinsic_decoder(
                     decode=model.decode, z=z_curv,
                     lam=float(getattr(curv_cfg, "reg_lambda", 1e-6)),
@@ -183,7 +192,7 @@ def ae_loss(
                 JGL = (me_out["J"], me_out["G"], me_out["L"])
 
             # ---- MICAE (intrinsic via Gauss) ----
-            if intr_w > 0.0 and do_intr:
+            if do_intr:
                 mi_out = micae_intrinsic_decoder(
                     decode=model.decode, z=z_curv,
                     lam=float(getattr(intr_cfg, "reg_lambda", curv_cfg.get("reg_lambda", 1e-6))),
@@ -198,20 +207,53 @@ def ae_loss(
                 eic = mi_out["EIC"].mean().to(x.dtype)
                 total += intr_w * eic
                 mi_iter_val = float(eic.detach().item())
-                
-                # ---- expose MICAE debug scalars (prefixed) ----
-                # NOTE: mi_out contains tensors; we forward only 0-D scalars.
+                # expose MICAE debug scalars
                 for k, v in mi_out.items():
                     if k == "EIC":
                         continue
                     if isinstance(v, torch.Tensor) and v.ndim == 0 and torch.isfinite(v):
-                        # This line no longer causes an error because `metrics` exists.
                         metrics[f"reg/micae/{k}"] = float(v.detach().item())
-                # also add the batch-mean EIC under a clear key
                 metrics["reg/micae/EIC_mean"] = mi_iter_val
+
+            # ---- Metric Smoothness (invariant, G^{-1}-normalised) ----
+            if do_ms:
+                # optional: allow a separate target for MS; default = curvature target
+                target_ms = str(getattr(ms_cfg, "target", target)).lower()
+                if target_ms == "encoder":
+                    dec_mod_ms = _guess_decoder_module(model)
+                    freeze_ctx_ms = freeze_params(dec_mod_ms)
+                    z_for_ms = z_full32[idx]  # same sub-batch as curvature
+                elif target_ms == "both":
+                    freeze_ctx_ms = nullcontext()
+                    z_for_ms = z_full32[idx]
+                else:  # "decoder"
+                    freeze_ctx_ms = nullcontext()
+                    z_for_ms = z_full32[idx].detach()
+
+                with freeze_ctx_ms:
+                    ms_out = metric_smoothness_decoder_Ginv_fast(
+                        decode=model.decode,
+                        z=z_for_ms,  # (B_curv, m)
+                        K_w=int(getattr(ms_cfg, "K_w", 1)),
+                        use_rademacher=bool(getattr(ms_cfg, "use_rademacher", True)),
+                        use_exact_hessian=bool(getattr(ms_cfg, "use_exact_hessian", True)),
+                        fd_eps=float(getattr(ms_cfg, "fd_eps", 1e-3)),
+                        JGL=JGL,  # reuse J,G,L from MECAE if available
+                        normalize_by_dim=bool(getattr(ms_cfg, "normalize_by_dim", True)),
+                    )
+                    msm = ms_out["MSM_G"].mean().to(x.dtype)
+                    total += ms_w * msm
+                    ms_iter_val = float(msm.detach().item())
 
     if train:
         setattr(model, step_attr, int(step) + 1)
+
+    # stem alpha (if present)
+    stem_alpha = None
+    try:
+        stem_alpha = float(getattr(getattr(model, "decoder", None), "stem", None).alpha.item())
+    except Exception:
+        pass
 
     metrics.update({
         "loss/total":          float(total.detach().item()),
@@ -221,6 +263,8 @@ def ae_loss(
         "reg/dec_iso":         float(dec_iso.detach().item()),
         "reg/mecae_eec":       me_iter_val,
         "reg/micae_eic":       mi_iter_val,
+        "reg/metric_smoothness": ms_iter_val,
+        "model/stem_alpha":    stem_alpha,
     })
 
     return total, metrics
