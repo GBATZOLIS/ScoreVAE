@@ -244,16 +244,16 @@ def compute_entropy_profile(
         fig, ax = plt.subplots(1, 2, figsize=(14, 5))
 
         # entropy rates (log-x so early-time structure is readable)
-        ax[0].plot(t, Hs, label=r"$\dot H$ (score/Song)")
-        ax[0].plot(t, Hm, ":", label=r"$\dot H$ (MMSE/EDM)")
+        #ax[0].plot(t, Hs, label=r"$\dot H$ (score/Song)")
+        #ax[0].plot(t, Hm, ":", label=r"$\dot H$ (MMSE/EDM)")
         ax[0].plot(t, HRs, "--", label=r"$\sigma_{\mathrm{Song}}\dot H$")
         ax[0].plot(t, HRm, "-.", label=r"$\sigma_{\mathrm{EDM}}\dot H$")
         ax[0].set_xscale("log"); ax[0].grid(True, ls=":")
         ax[0].set_xlabel("t (log)"); ax[0].set_title("Entropy rate"); ax[0].legend()
 
         # cumulative entropic times
-        ax[1].plot(ts, Phi_s, label=r"$\Phi$ (score)")
-        ax[1].plot(tm, Phi_m, ":", label=r"$\Phi$ (MMSE)")
+        #ax[1].plot(ts, Phi_s, label=r"$\Phi$ (score)")
+        #ax[1].plot(tm, Phi_m, ":", label=r"$\Phi$ (MMSE)")
         ax[1].plot(ts, PhiR_s, "--", label=r"$\tilde{\Phi}$ (score)")
         ax[1].plot(tm, PhiR_m, "-.", label=r"$\tilde{\Phi}$ (MMSE)")
         ax[1].set_xscale("log"); ax[1].grid(True, ls=":")
@@ -274,15 +274,28 @@ def schedule_from_rescaled_entropic_time(
     t_hi: float | None = None,
     descending: bool = True,
 ) -> list[float]:
-    """Uniform in rescaled entropic time."""
+    """Return n_stages times uniformly spaced in rescaled entropic time,
+    INCLUDING both endpoints t_lo and t_hi."""
     assert t.ndim == 1 and Phi_rescaled.ndim == 1 and t.shape == Phi_rescaled.shape
+
+    # sort by t if needed
     if not np.all(np.diff(t) > 0):
-        idx = np.argsort(t); t, Phi_rescaled = t[idx], Phi_rescaled[idx]
+        idx = np.argsort(t)
+        t, Phi_rescaled = t[idx], Phi_rescaled[idx]
+
+    # clip to [t_lo, t_hi]
     if t_lo is None: t_lo = float(t[0])
     if t_hi is None: t_hi = float(t[-1])
     m = (t >= t_lo) & (t <= t_hi)
     tt, phi = t[m], Phi_rescaled[m]
-    phi = (phi - phi[0]) / max(1e-12, (phi[-1] - phi[0]))
-    targets = np.linspace(0.0, 1.0, n_stages + 1)[1:]
-    sched = np.interp(targets, phi, tt).tolist()
-    return sorted(set(float(x) for x in sched), reverse=descending)
+
+    # normalize Φ̃ to [0,1]
+    denom = float(phi[-1] - phi[0]) if len(phi) > 1 else 1.0
+    phi = (phi - phi[0]) / max(1e-12, denom)
+
+    # n_stages points including both endpoints (0 and 1)
+    targets = np.linspace(0.0, 1.0, int(n_stages))
+    sched = np.interp(targets, phi, tt)  # [t_lo, ..., t_hi]
+    if descending:
+        sched = sched[::-1]
+    return [float(x) for x in sched]

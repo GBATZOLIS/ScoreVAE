@@ -67,6 +67,8 @@ class mlp(nn.Module):
         sigma_fn = sde.get_sigma_fn()
         def denoiser_fn(x_t, y, t):
             sigma_t, alpha_t = sigma_fn(t), alpha_fn(t)
+            sigma_t = sigma_t.view(sigma_t.shape[0], *[1 for _ in range(len(x_t.shape) - 1)])  # Expand dimensions
+            alpha_t = alpha_t.view(alpha_t.shape[0], *[1 for _ in range(len(x_t.shape) - 1)])  # Expand dimensions
             noise_pred = self.forward(x_t, y, t)
             x_denoised = (x_t - sigma_t * noise_pred) / alpha_t
             return x_denoised

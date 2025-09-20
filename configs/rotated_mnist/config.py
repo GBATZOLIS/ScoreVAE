@@ -18,7 +18,7 @@ def get_config():
 
     # training
     cfg.training = tr = ml_collections.ConfigDict()
-    tr.device               = "cuda:0"
+    tr.device               = "cuda:1"
     tr.gpus                 = 1
     tr.epochs               = 400                # extended runway
     tr.checkpoint_frequency = 5

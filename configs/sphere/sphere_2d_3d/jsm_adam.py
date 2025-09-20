@@ -1,10 +1,11 @@
 # geodesic_config.py  (Jacobian)
 CONFIG = {
     "random_seed": 42,
-    "num_pairs": 100,
+    "num_pairs": 20,
 
     # diffusion / schedule
-    "time_schedule": [0.06, 0.05, 0.04, 0.03],
+    "time_schedule": [0.03],
+    "endpoint_mode": "clean",  # {"clean","noisy"}
 
     # metric
     "metric_type": "jacobian",      # {"stein", "jacobian"}

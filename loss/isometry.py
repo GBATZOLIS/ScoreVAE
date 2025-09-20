@@ -1,77 +1,18 @@
 # loss/isometry.py
 from __future__ import annotations
+from typing import Callable, Optional
 import torch
-from torch import func as func  # torch>=2.0
-from typing import Callable
+from torch import func as func  # torch >= 2.0
 
-@torch.enable_grad()
-def approximate_orthogonal_jacobian_regularisation(
-    phi: Callable[[torch.Tensor], torch.Tensor],
-    x: torch.Tensor,
-    *,
-    num_v: int = 16,
-    train: bool = True,
-    device: torch.device | str = "cpu",
-) -> torch.Tensor:
-    """
-    Encourages local isometry by matching Gram(J v_i) ≈ I for random orthonormal {v_i}.
-    Uses JVPs; QR is computed in float32 (AMP-safe), then cast to x.dtype.
-    """
-    B = x.shape[0]
-    flat_dim = x[0].numel()
-
-    # ensure good layout for norms/conv during JVP
-    if x.ndim == 4:
-        x = x.contiguous(memory_format=torch.contiguous_format)
-    else:
-        x = x.contiguous()
-    x = x.requires_grad_(True)
-
-    # ---- AMP-safe orthonormal directions (QR in fp32) ----
-    with torch.amp.autocast("cuda", enabled=False):
-        rand32 = torch.randn(B, flat_dim, num_v, device=device, dtype=torch.float32)
-        q32, _ = torch.linalg.qr(rand32, mode="reduced")  # (B, n, num_v), fp32
-    q = q32.to(dtype=x.dtype)
-    v = q.permute(2, 0, 1).reshape(num_v, B, *x.shape[1:])  # (num_v, B, ...)
-
-    if v.ndim == 5:  # image tensors
-        v = v.contiguous(memory_format=torch.contiguous_format)
-    else:
-        v = v.contiguous()
-
-    # ---- JVP over v directions ----
-    def jvp_single(v_single):
-        if v_single.ndim == 4:
-            v_single = v_single.contiguous(memory_format=torch.contiguous_format)
-        else:
-            v_single = v_single.contiguous()
-        return func.jvp(phi, (x,), (v_single,))[1]
-
-    if not train:
-        torch.set_grad_enabled(True)
-    Jv = func.vmap(jvp_single)(v)  # (num_v, B, *out)
-    if not train:
-        torch.set_grad_enabled(False)
-
-    # (B, num_v, m)
-    Jv = Jv.reshape(num_v, B, -1).permute(1, 0, 2)
-
-    # Gram ≈ I
-    G = torch.bmm(Jv, Jv.transpose(1, 2))
-    I = torch.eye(num_v, device=Jv.device, dtype=Jv.dtype).expand(B, num_v, num_v)
-    diff = G - I
-    return (diff ** 2).sum(dim=(1, 2)).mean()
-
-def _orthonormal_frame(B: int, dim: int, r: int, *, device, dtype):
+def _qr_frame(B: int, dim: int, r: int, *, device, dtype) -> torch.Tensor:
     r = min(r, dim)
     with torch.amp.autocast("cuda", enabled=False):
         M32 = torch.randn(B, dim, r, device=device, dtype=torch.float32)
-        Q32, _ = torch.linalg.qr(M32, mode="reduced")
-    Q = Q32.to(dtype=dtype)
-    return Q.permute(2, 0, 1)  # (r, B, dim)
+        Q32, _ = torch.linalg.qr(M32, mode="reduced")  # (B, dim, r)
+    return Q32.to(dtype=dtype).permute(2, 0, 1)       # (r, B, dim)
 
 @torch.enable_grad()
-def encoder_row_orthogonality_regularisation(
+def encoder_isometry_regularisation(
     encode: Callable[[torch.Tensor], torch.Tensor],
     x: torch.Tensor,
     *,
@@ -79,32 +20,60 @@ def encoder_row_orthogonality_regularisation(
     train: bool = True,
     device: torch.device | str = "cpu",
 ) -> torch.Tensor:
-    # Turn grad on even in eval so VJP can be formed; turn it back off after.
-    if not train:
-        torch.set_grad_enabled(True)
-
+    """
+    Local isometry for the encoder: J_e(x)^T U should have orthonormal rows,
+    where U are Euclidean-orthonormal in the latent space.
+    """
+    if not train: torch.set_grad_enabled(True)
     x = x.contiguous().requires_grad_(True)
 
-    def f(inp):  # (B, C, H, W) -> (B, k)
-        return encode(inp)
-
+    def f(inp): return encode(inp)          # (B, ...) -> (B, k)
     y, vjp_fn = func.vjp(f, x)              # y: (B, k)
     B, k = y.shape
+    r = min(num_v, k)
 
-    U = _orthonormal_frame(B, k, num_v, device=device, dtype=y.dtype)  # (r, B, k)
+    # Simplified: Always build a Euclidean orthonormal frame
+    U = _qr_frame(B, k, r, device=device, dtype=y.dtype)
 
-    def single_vjp(u_single):               # u_single: (B, k)
-        (vx,) = vjp_fn(u_single)            # (B, ...)
-        return vx
+    def single_vjp(u_single):  # (B, k) -> (B, ...)
+        (vx,) = vjp_fn(u_single); return vx
 
     V = func.vmap(single_vjp)(U)            # (r, B, ...)
-    if not train:
-        torch.set_grad_enabled(False)
+    if not train: torch.set_grad_enabled(False)
 
-    V = V.reshape(V.shape[0], V.shape[1], -1).permute(1, 0, 2)   # (B, r, n)
+    V = V.reshape(V.shape[0], V.shape[1], -1).permute(1, 0, 2)  # (B, r, n)
+    G = torch.bmm(V.float(), V.float().transpose(1, 2))         # (B, r, r)
+    I = torch.eye(G.size(-1), device=G.device, dtype=G.dtype).expand_as(G)
+    return (G - I).pow(2).sum(dim=(1, 2)).mean()
 
-    # Compute Gram in fp32 for stability under AMP
-    Vf = V.float()
-    G  = torch.bmm(Vf, Vf.transpose(1, 2))                       # (B, r, r)
-    I  = torch.eye(G.size(-1), device=G.device, dtype=G.dtype).expand_as(G)
+@torch.enable_grad()
+def decoder_isometry_regularisation(
+    decode: Callable[[torch.Tensor], torch.Tensor],
+    z: torch.Tensor,
+    *,
+    num_v: int = 16,
+    train: bool = True,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """
+    Local isometry for the decoder: Gram(J_d(z) u_i) ≈ I for Euclidean latent/data metrics.
+    Uses JVPs with orthonormal latent directions.
+    """
+    B, d = z.shape[0], z[1:].numel() if z.dim() > 2 else z.shape[1]
+    z = z.contiguous().requires_grad_(True)
+
+    # build orthonormal u_i in latent (Euclidean)
+    U = _qr_frame(B, z.shape[1], min(num_v, z.shape[1]), device=device, dtype=z.dtype)  # (r,B,d)
+    U = U.reshape(U.shape[0], B, *z.shape[1:])  # match shape for decode JVPs
+
+    def jvp_single(u_single):  # (B,d) or (B,...) -> (B, *xshape)
+        return func.jvp(decode, (z,), (u_single.contiguous(),))[1]
+
+    if not train: torch.set_grad_enabled(True)
+    Jv = func.vmap(jvp_single)(U)    # (r, B, *xshape)
+    if not train: torch.set_grad_enabled(False)
+
+    Jv = Jv.reshape(Jv.shape[0], B, -1).permute(1, 0, 2)  # (B, r, n_x)
+    G = torch.bmm(Jv, Jv.transpose(1, 2))                 # (B, r, r)
+    I = torch.eye(G.size(-1), device=G.device, dtype=G.dtype).expand_as(G)
     return (G - I).pow(2).sum(dim=(1, 2)).mean()

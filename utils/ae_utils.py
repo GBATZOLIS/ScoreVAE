@@ -1,22 +1,110 @@
 # utils/ae_utils.py
 from __future__ import annotations
+from typing import List, Dict, Tuple, Optional
 import math
+import os
+from contextlib import contextmanager
+
+import numpy as np
 import torch
 import torchvision.utils as vutils
-from contextlib import contextmanager
 import matplotlib.pyplot as plt
+import torch.distributed as dist
+
+
+# Try to import SummaryWriter only if available
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = object  # type: ignore
+
+
+# ────────────────────────── mode helpers ──────────────────────────
 
 @contextmanager
 def evaluation_mode(model):
-    was_train = model.training
-    model.eval()
+    """Temporarily sets a torch.nn.Module to eval mode and restores the
+    previous training state on exit."""
+    was_train = getattr(model, "training", False)
+    if hasattr(model, "eval"):
+        model.eval()
     try:
         yield
     finally:
-        if was_train:
+        if was_train and hasattr(model, "train"):
             model.train()
 
+
+# ────────────────────────── logging callbacks ──────────────────────────
+
+
+def get_update_latent_normalizer_callback(
+    *,
+    min_count: int = 6000,
+    max_batches: int | None = None,
+    tag_prefix: str = "AE",
+    eps: float = 1e-6,
+):
+    """
+    End-of-epoch callback (DDP-aware):
+      • encodes ~min_count latents per *global* world (splits quota per rank if DDP)
+      • computes global per-dim μ, σ via all_reduce on sums and sums of squares
+      • updates model.set_latent_normalization(μ, σ) on all ranks
+      • logs quick summaries to TensorBoard (rank0 only)
+    """
+
+    def _ddp_active():
+        return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+
+    def cb(val_loader, writer, model, device, epoch):
+        world = dist.get_world_size() if _ddp_active() else 1
+        rank = dist.get_rank() if _ddp_active() else 0
+
+        # Per-rank quota
+        local_target = int(math.ceil(min_count / world))
+
+        with evaluation_mode(model), torch.no_grad():
+            Z = encode_latents_from_loader(
+                model=model, loader=val_loader, device=device,
+                min_count=local_target, max_batches=max_batches
+            ).float()  # (N_r, d)
+
+        # Compute local sums
+        local_n = torch.tensor([Z.size(0)], device=device, dtype=torch.float64)
+        local_sum = Z.sum(dim=0, dtype=torch.float64)  # (d,)
+        local_sq  = (Z * Z).sum(dim=0, dtype=torch.float64)
+
+        if _ddp_active():
+            dist.all_reduce(local_n, op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_sq,  op=dist.ReduceOp.SUM)
+
+        N = max(1.0, float(local_n.item()))
+        mu = (local_sum / N).to(dtype=Z.dtype)
+        var = (local_sq / N) - mu.to(dtype=torch.float64).pow(2)
+        var = torch.clamp(var, min=eps)
+        sd  = torch.sqrt(var).to(dtype=Z.dtype)
+
+        # Update on all ranks
+        model.set_latent_normalization(mu.to(device), sd.to(device), eps=eps)
+
+        # Logging (rank0 only)
+        if isinstance(writer, object) and rank == 0:
+            try:
+                writer.add_scalar(f"{tag_prefix}/latent_norm/mean_abs_mean", float(mu.abs().mean().item()), epoch)
+                writer.add_scalar(f"{tag_prefix}/latent_norm/mean_std",      float(sd.mean().item()), epoch)
+                if mu.numel() <= 64:
+                    writer.add_histogram(f"{tag_prefix}/latent_norm/mu_hist", mu, epoch)
+                    writer.add_histogram(f"{tag_prefix}/latent_norm/sd_hist", sd, epoch)
+            except Exception:
+                pass
+
+        if rank == 0:
+            print(f"[LatentNorm] epoch {epoch}: |μ|_mean={mu.abs().mean():.3f}  σ_mean={sd.mean():.3f}  (global N≈{int(N)})")
+    return cb
+
 def get_reconstruction_callback():
+    """Returns a callback that logs original and reconstructed images."""
     def recon_callback(batch, writer, model, device, epoch, tag_prefix="AE"):
         x = batch[0].to(device)
         n = min(x.size(0), 36)
@@ -32,52 +120,807 @@ def get_reconstruction_callback():
         writer.add_image(f"{tag_prefix}/reconstruction", grid_out, epoch)
     return recon_callback
 
-def get_latent_scatter_callback(num_batches: int = 2, max_points: int = 2000):
+
+def get_latent_scatter_callback(
+    num_batches: int = 2,
+    max_points: int = 2000,
+    mode: str = "both",
+    views3d=None,           # list of (elev, azim)
+    dims3d=(0, 1, 2),
+    point_size_2d: float = 5.0,
+    point_size_3d: float = 4.0,
+    alpha_2d: float = 0.6,
+    alpha_3d: float = 0.6,
+):
     """
-    Returns a callback that plots the first latent dims of a few batches.
-    If latent_dim >= 3: plots (z0,z1), (z1,z2), (z0,z2) as separate figures.
-    If latent_dim == 2: plots (z0,z1) only.
+    Plots latent scatters.
+      mode ∈ {"raw", "norm", "both"}:
+        - "raw"  : z = model.encode(x)
+        - "norm" : ẑ = model.normalize_latent(model.encode(x)) if available else z
+        - "both" : logs both; 3D is ONLY for 'norm'
     """
-    def _plot_and_log(writer, tag_prefix, epoch, z_all, i, j, title_suffix=""):
-        import matplotlib.pyplot as plt
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    mode = str(mode).lower()
+    assert mode in {"raw", "norm", "both"}, "mode must be 'raw', 'norm', or 'both'"
+
+    if views3d is None:
+        views3d = [(20, 30), (20, 150), (20, 270)]
+
+    def _maybe_norm(model, z):
+        fn = getattr(model, "normalize_latent", None)
+        return fn(z) if callable(fn) else z
+
+    def _plot2d_and_log(writer, tag_prefix, epoch, z_all, i, j, subtag):
         fig, ax = plt.subplots(figsize=(5, 5))
-        ax.scatter(z_all[:, i], z_all[:, j], s=5, alpha=0.6)
-        ax.set_xlabel(f"z[{i}]")
-        ax.set_ylabel(f"z[{j}]")
-        ttl = f"Latent scatter (z[{i}] vs z[{j}])"
-        if title_suffix:
-            ttl += f" — {title_suffix}"
-        ax.set_title(ttl)
-        writer.add_figure(f"{tag_prefix}/latent_scatter/z{i}{j}", fig, epoch)
+        ax.scatter(z_all[:, i], z_all[:, j], s=point_size_2d, alpha=alpha_2d)
+        ax.set_xlabel(f"z[{i}]"); ax.set_ylabel(f"z[{j}]")
+        ax.set_title(f"Latent scatter ({subtag}): z[{i}] vs z[{j}]")
+        writer.add_figure(f"{tag_prefix}/latent_scatter/{subtag}_z{i}{j}", fig, epoch)
         plt.close(fig)
 
+    def _set_axes_equal_3d(ax, X, Y, Z):
+        x_mid, y_mid, z_mid = (X.min()+X.max())/2, (Y.min()+Y.max())/2, (Z.min()+Z.max())/2
+        max_range = max(X.max()-X.min(), Y.max()-Y.min(), Z.max()-Z.min()) / 2
+        if max_range == 0: max_range = 1.0
+        ax.set_xlim(x_mid - max_range, x_mid + max_range)
+        ax.set_ylim(y_mid - max_range, y_mid + max_range)
+        ax.set_zlim(z_mid - max_range, z_mid + max_range)
+
+    def _plot3d_views_and_log(writer, tag_prefix, epoch, z_all, i, j, k, subtag):
+        X, Y, Z = z_all[:, i].numpy(), z_all[:, j].numpy(), z_all[:, k].numpy()
+        for v_idx, (elev, azim) in enumerate(views3d, start=1):
+            fig = plt.figure(figsize=(5, 5))
+            ax = fig.add_subplot(111, projection="3d")
+            ax.scatter(X, Y, Z, s=point_size_3d, alpha=alpha_3d, depthshade=True)
+            ax.set_xlabel(f"z[{i}]"); ax.set_ylabel(f"z[{j}]"); ax.set_zlabel(f"z[{k}]")
+            ax.view_init(elev=elev, azim=azim)
+            _set_axes_equal_3d(ax, np.asarray(X), np.asarray(Y), np.asarray(Z))
+            ax.set_title(f"Latent 3D ({subtag}) view {v_idx}: z[{i}], z[{j}], z[{k}]")
+            writer.add_figure(f"{tag_prefix}/latent_scatter3d/{subtag}_z{i}{j}{k}_view{v_idx}", fig, epoch)
+            plt.close(fig)
+
     def latent_callback(val_loader, writer, model, device, epoch, tag_prefix="AE"):
-        zs = []
+        zs_raw, zs_hat = [], []
+        has_norm = callable(getattr(model, "normalize_latent", None))
+
         with evaluation_mode(model), torch.no_grad():
             for b_idx, (x, *_) in enumerate(val_loader):
-                if b_idx >= num_batches:
-                    break
-                x = x.to(device)
+                if b_idx >= num_batches: break
+                x = x.to(device, non_blocking=True)
                 z = model.encode(x)
-                zs.append(z.detach().cpu())
+                if mode in {"raw", "both"}:
+                    zs_raw.append(z.detach().cpu())
+                if mode in {"norm", "both"}:
+                    z_hat = _maybe_norm(model, z)
+                    zs_hat.append(z_hat.detach().cpu())
 
-        if not zs:
-            print("[Warning] No batches collected for latent scatter.")
-            return
+        def _handle_block(zlist, subtag, do_3d: bool):
+            if not zlist: return
+            z_all = torch.cat(zlist, dim=0)[:max_points]
+            D = z_all.size(1)
 
-        z_all = torch.cat(zs, dim=0)
-        if z_all.size(1) < 2:
-            print("[Warning] Latent dim < 2, cannot plot scatter.")
-            return
+            # 2D panels
+            if D >= 2: _plot2d_and_log(writer, tag_prefix, epoch, z_all, 0, 1, subtag)
+            if D >= 3:
+                _plot2d_and_log(writer, tag_prefix, epoch, z_all, 1, 2, subtag)
+                _plot2d_and_log(writer, tag_prefix, epoch, z_all, 0, 2, subtag)
 
-        z_all = z_all[:max_points]
+            # 3D only when requested + latent_dim>=3
+            if do_3d and D >= 3:
+                i, j, k = dims3d
+                i = min(i, D-1); j = min(j, D-1); k = min(k, D-1)
+                if len({i, j, k}) < 3:
+                    # fallback to first 3 unique
+                    idxs = []
+                    for t in range(D):
+                        if t not in idxs: idxs.append(t)
+                        if len(idxs) == 3: break
+                    if len(idxs) == 3:
+                        i, j, k = idxs
+                _plot3d_views_and_log(writer, tag_prefix, epoch, z_all, i, j, k, subtag)
 
-        # Always plot z0 vs z1
-        _plot_and_log(writer, tag_prefix, epoch, z_all, 0, 1)
+        # RAW: 2D only
+        if mode in {"raw", "both"}:
+            _handle_block(zs_raw, "raw", do_3d=False)
 
-        # If we have at least 3 dims, also plot z1 vs z2 and z0 vs z2
-        if z_all.size(1) >= 3:
-            _plot_and_log(writer, tag_prefix, epoch, z_all, 1, 2)
-            _plot_and_log(writer, tag_prefix, epoch, z_all, 0, 2)
+        # NORM: 2D + 3D (only if normalize_latent exists)
+        if mode in {"norm", "both"}:
+            if not has_norm:
+                print("[LatentScatter] normalize_latent() not found; skipping 3D normalized plots.")
+            _handle_block(zs_hat, "norm", do_3d=has_norm)
 
     return latent_callback
+
+
+def get_prior_variance_callback():
+    """
+    Logs a bar plot of learned PRIOR variances (diag Σ_z) sorted high→low.
+    Expects `model.prior_logvar` (shape [d]) to exist.
+    """
+    def cb(writer, model, epoch, tag_prefix="AE"):
+        prior_logvar = getattr(model, "prior_logvar", None)
+        if prior_logvar is None:
+            print("[VarViz] Model has no learnable prior_logvar; skipping prior variance plot.")
+            return
+        with torch.no_grad():
+            var = prior_logvar.detach().exp().cpu()   # σ_p^2 (d,)
+            vals, _ = torch.sort(var, descending=True)
+
+        fig, ax = plt.subplots(figsize=(6, 3))
+        ax.bar(range(len(vals)), vals.numpy())
+        ax.set_title("Learned prior variances (sorted)")
+        ax.set_xlabel("sorted latent dim")
+        ax.set_ylabel("σ_p²")
+        writer.add_figure(f"{tag_prefix}/prior_variances_sorted", fig, epoch)
+        plt.close(fig)
+
+    return cb
+
+
+def get_prior_vs_posterior_var_callback(num_batches: int = 3, max_points: int = 4096):
+    """
+    Plots PRIOR σ_p² vs average POSTERIOR σ_q² from encoder logvar,
+    sorted by PRIOR variance.
+    """
+    def cb(val_loader, writer, model, device, epoch, tag_prefix="AE"):
+        prior_logvar = getattr(model, "prior_logvar", None)
+        if prior_logvar is None:
+            print("[VarViz] No learnable prior; plotting posterior variance only.")
+
+        with torch.no_grad():
+            logs = []
+            count = 0
+            for b_idx, (x, *_) in enumerate(val_loader):
+                if b_idx >= num_batches or count >= max_points:
+                    break
+                x = x.to(device, non_blocking=True)
+                if hasattr(model, "encode_stats"):
+                    _, logvar = model.encode_stats(x)
+                else:
+                    logvar = torch.zeros(x.size(0), getattr(model, "z_dim", 1), device=x.device)
+                logs.append(logvar.detach().cpu())
+                count += x.size(0)
+
+            if not logs:
+                print("[VarViz] No validation batches for posterior variance.")
+                return
+
+            post_var = torch.cat(logs, dim=0).exp().mean(dim=0)  # (d,)
+            if prior_logvar is not None:
+                prior_var = prior_logvar.detach().exp().cpu()
+            else:
+                prior_var = torch.ones_like(post_var)
+
+            order = torch.argsort(prior_var, descending=True)
+            p = prior_var[order].numpy()
+            q = post_var[order].numpy()
+
+        x_idx = np.arange(len(p))
+        fig, ax = plt.subplots(figsize=(7, 3))
+        w = 0.4
+        ax.bar(x_idx - w/2, p, width=w, label="prior σ_p²")
+        ax.bar(x_idx + w/2, q, width=w, label="avg posterior σ_q²")
+        ax.set_title("Latent variances (sorted by prior)")
+        ax.set_xlabel("sorted latent dim")
+        ax.set_ylabel("variance")
+        ax.legend()
+        writer.add_figure(f"{tag_prefix}/prior_vs_posterior_variance", fig, epoch)
+        plt.close(fig)
+
+    return cb
+
+
+# ────────────────────────── data gathering ──────────────────────────
+
+@torch.no_grad()
+def gather_images(loader, device: torch.device, needed: int) -> torch.Tensor:
+    """Collects just enough images from a loader to reach `needed` samples."""
+    xs = []
+    count = 0
+    it = iter(loader)
+    while count < needed:
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
+        x = batch[0].to(device, non_blocking=True)
+        xs.append(x)
+        count += x.size(0)
+    if not xs:
+        raise RuntimeError("Loader is empty; cannot gather images.")
+    X = torch.cat(xs, dim=0)
+    if X.size(0) < needed:
+        print(f"[GatherImages] Warning: requested {needed} but only found {X.size(0)}.")
+    return X[:needed]
+
+
+@torch.no_grad()
+def encode_latents_from_loader(
+    model,
+    loader,
+    device: torch.device,
+    min_count: int = 3000,
+    max_batches: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Encode batches until we reach at least `min_count` latent points.
+    Returns Z with len(Z) >= min_count if data allows (otherwise logs a warning).
+    """
+    zs = []
+    total = 0
+    it = iter(loader)
+    b = 0
+    with evaluation_mode(model):
+        while total < min_count:
+            if max_batches is not None and b >= max_batches:
+                break
+            try:
+                batch = next(it)
+            except StopIteration:
+                break
+            x = batch[0].to(device, non_blocking=True)
+            z = model.encode(x).detach()
+            zs.append(z)
+            total += z.size(0)
+            b += 1
+
+    if not zs:
+        raise RuntimeError("[EncodeLatents] No data in loader to encode.")
+    Z = torch.cat(zs, dim=0)
+    if Z.size(0) < min_count:
+        print(f"[EncodeLatents] Warning: requested {min_count} latents but only encoded {Z.size(0)}.")
+    return Z  # caller can subsample further if desired
+
+
+# ────────────────────────── latent corruption viz ──────────────────────────
+
+@torch.no_grad()
+def _subsample(latents: torch.Tensor, num_points: int, seed: int = 0) -> torch.Tensor:
+    """Subsample rows without replacement for consistent viz."""
+    n = latents.shape[0]
+    if num_points >= n:
+        return latents
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    idx = torch.randperm(n, generator=g)[:num_points]
+    return latents[idx]
+
+
+@torch.no_grad()
+def _collect_perturbed(
+    latents: torch.Tensor,
+    latent_sde,
+    time_schedule: List[float],
+) -> List[Tuple[float, np.ndarray]]:
+    """
+    Returns list of (t, z_t) where z_t are perturbed points at time t.
+    Uses latent_sde.perturb(x, t) which internally calls marginal_prob.
+    """
+    out: List[Tuple[float, np.ndarray]] = []
+    for t in time_schedule:
+        t_tensor = torch.tensor(float(t), dtype=latents.dtype, device=latents.device)
+        z_t = latent_sde.perturb(latents, t_tensor)  # (M, D)
+        out.append((float(t), z_t.detach().cpu().numpy()))
+    return out
+
+
+def _global_axis_limits(
+    sets: List[np.ndarray],
+    pad_ratio: float = 0.05
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute per-dimension min/max across all sets with padding."""
+    all_concat = np.concatenate(sets, axis=0)  # (K*M, D)
+    mins = all_concat.min(axis=0)
+    maxs = all_concat.max(axis=0)
+    pad = pad_ratio * (maxs - mins + 1e-12)
+    return mins - pad, maxs + pad
+
+def _save_geodesic_comparison_grid(
+    pred_stack: torch.Tensor,   # (B, T, C, H, W) in [0,1]
+    gt_stack: torch.Tensor,     # (B, T, C, H, W) in [0,1]
+    out_path: str,
+    *,
+    padding: int = 2,
+    row_gap: int = 2,
+    pair_gap: int = 12,
+) -> str:
+    """
+    Save a comparison grid per pair:
+      Top row: estimated geodesic frames (T columns)
+      Bottom row: ground-truth frames (T columns)
+    Pairs are stacked vertically with a gap between them.
+    """
+    pred_stack = pred_stack.detach().cpu().clamp(0.0, 1.0)
+    gt_stack   = gt_stack.detach().cpu().clamp(0.0, 1.0)
+
+    B, T, C, H, W = pred_stack.shape
+    blocks = []
+    for i in range(B):
+        # make_grid expects (N, C, H, W)
+        pred_grid = vutils.make_grid(pred_stack[i], nrow=T, padding=padding)
+        gt_grid   = vutils.make_grid(gt_stack[i],   nrow=T, padding=padding)
+
+        Cg, Hr, Wr = pred_grid.shape
+        row_gap_img  = torch.zeros(Cg, row_gap, Wr)
+        pair_gap_img = torch.zeros(Cg, pair_gap, Wr)
+
+        pair_block = torch.cat([pred_grid, row_gap_img, gt_grid], dim=1)
+        blocks.append(pair_block)
+        if i < B - 1:
+            blocks.append(pair_gap_img)
+
+    big_img = torch.cat(blocks, dim=1)  # (C, H_total, W)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    vutils.save_image(big_img, out_path)
+    return out_path
+
+# Optional public alias without the leading underscore
+def save_geodesic_comparison_grid(*args, **kwargs) -> str:
+    return _save_geodesic_comparison_grid(*args, **kwargs)
+
+
+def plot_latent_corruptions(
+    latents: torch.Tensor,
+    latent_sde,
+    time_schedule: List[float],
+    *,
+    num_points: int = 4000,
+    seed: int = 0,
+    out_path: Optional[str] = None,
+    figsize_unit: float = 3.0,
+    dpi: int = 150,
+    point_size: float = 4.0,
+    alpha: float = 0.8,
+) -> Dict[str, str]:
+    """
+    Visualize perturbed latent distributions for given diffusion times.
+
+    Layout:
+      - D=2: 1 row, C columns (smallest t -> largest t)
+      - D=3: 3 rows (xy, yz, xz), C columns (smallest t -> largest t)
+    """
+    assert latents.ndim == 2, f"Expected latents of shape (N, D); got {tuple(latents.shape)}"
+    _, D = latents.shape
+    assert D in (2, 3), f"Only D=2 or D=3 supported, got D={D}"
+
+    # Ensure plenty of latents; we still subsample for plotting density & speed.
+    latents = latents.detach()
+    latents = _subsample(latents, num_points=num_points, seed=seed)
+
+    times = sorted(set(float(t) for t in time_schedule))
+    if len(times) == 0:
+        raise ValueError("time_schedule must contain at least one time.")
+
+    # Perturb via the latent SDE’s corruption kernel
+    perturbed = _collect_perturbed(latents, latent_sde, times)
+
+    # Global axis limits for consistent scale across columns
+    mins, maxs = _global_axis_limits([z for _, z in perturbed])
+
+    # Figure layout
+    if D == 2:
+        nrows, ncols = 1, len(times)
+    else:
+        nrows, ncols = 3, len(times)  # xy / yz / xz
+
+    # Figure size
+    fig_w = max(1, ncols) * figsize_unit
+    fig_h = max(1, nrows) * figsize_unit
+
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(fig_w, fig_h), dpi=dpi, squeeze=False)
+
+    def draw_scatter(ax, data: np.ndarray, dims: Tuple[int, int], title: str):
+        ax.scatter(data[:, dims[0]], data[:, dims[1]], s=point_size, alpha=alpha)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(mins[dims[0]], maxs[dims[0]])
+        ax.set_ylim(mins[dims[1]], maxs[dims[1]])
+        ax.set_xlabel(f"dim {dims[0]}")
+        ax.set_ylabel(f"dim {dims[1]}")
+        ax.set_title(title)
+
+    if D == 2:
+        for j, (t, zt) in enumerate(perturbed):
+            draw_scatter(axes[0, j], zt, (0, 1), title=f"t = {t:.4f}")
+    else:
+        for j, (t, zt) in enumerate(perturbed):
+            draw_scatter(axes[0, j], zt, (0, 1), title=f"t = {t:.4f} — x–y")
+            draw_scatter(axes[1, j], zt, (1, 2), title=f"t = {t:.4f} — y–z")
+            draw_scatter(axes[2, j], zt, (0, 2), title=f"t = {t:.4f} — x–z")
+
+    plt.tight_layout()
+
+    if out_path is None:
+        name = "latent_corruptions_2d.png" if D == 2 else "latent_corruptions_3d.png"
+        out_path = os.path.abspath(name)
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    return {"saved_path": out_path}
+
+
+# ────────────────────────── decode/visualize utilities ──────────────────────────
+
+@torch.no_grad()
+def decode_and_save_grid(
+    decoder,
+    z_samples: torch.Tensor,
+    eval_dir: str,
+    writer: Optional[SummaryWriter] = None,
+    *,
+    grid_nrow: int | None = None,
+    tag: str = "Latent2Image/Samples",
+    epoch: int = 0,
+) -> str:
+    """
+    Decode a batch of latent samples and save an image grid.
+    - Preserves/restores Module training mode if decoder is an nn.Module.
+    - Writes to TensorBoard if `writer` is provided.
+
+    Returns the saved PNG path.
+    """
+    import torch.nn as nn
+
+    if isinstance(decoder, nn.Module):
+        was_training = decoder.training
+        decoder.eval()
+        x_samples = decoder(z_samples)
+        if was_training:
+            decoder.train()
+    else:
+        x_samples = decoder(z_samples)
+
+    if grid_nrow is None:
+        grid_nrow = int(math.sqrt(max(1, x_samples.size(0))))
+
+    grid = vutils.make_grid(x_samples, nrow=grid_nrow, normalize=True, scale_each=True)
+    os.makedirs(eval_dir, exist_ok=True)
+    out_path = os.path.join(eval_dir, "latent2image_grid.png")
+    vutils.save_image(grid, out_path)
+
+    if writer is not None:
+        writer.add_image(tag, grid, epoch)
+
+    print(f"[Eval] Saved generated image grid → {out_path} (nrow={grid_nrow})")
+    return out_path
+
+
+def save_interactive_latent_geodesic_html(
+    *,
+    path_z_list: List[torch.Tensor],   # List[T] of (B, D) tensors
+    z_bg_pert: torch.Tensor,           # (N, D) background cloud at some t_final
+    out_dir: str,
+    filename: str = "latent_geodesics_latent3d.html",
+) -> str:
+    """
+    Render an interactive 3D HTML of latent geodesics (first 3 dims) overlaid on
+    a background cloud of perturbed latent points. Returns the saved path.
+    Gracefully no-ops (returns "") if Plotly is not available or D < 3.
+    """
+    try:
+        import plotly.graph_objs as go
+        from plotly.offline import plot as plotly_plot
+    except Exception as e:
+        print(f"[Eval] Plotly not available ({e}); skipping interactive latent 3D viz.")
+        return ""
+
+    # Stack trajectories → (T, B, D)
+    traj = torch.stack([pt.detach().cpu() for pt in path_z_list], dim=0)
+    if traj.ndim == 2:  # (T, D) → add batch dim
+        traj = traj.unsqueeze(1)
+    T, B, D = traj.shape
+    if D < 3:
+        print(f"[Eval] Latent dim D={D} < 3; skipping interactive 3D viz.")
+        return ""
+
+    z_bg = z_bg_pert.detach().cpu()
+    if z_bg.shape[1] < 3:
+        print(f"[Eval] Background latent dim {z_bg.shape[1]} < 3; skipping interactive 3D viz.")
+        return ""
+
+    fig = go.Figure()
+
+    # Add each trajectory as a 3D line
+    for i in range(B):
+        tr = traj[:, i, :3].numpy()
+        fig.add_trace(go.Scatter3d(
+            x=tr[:, 0], y=tr[:, 1], z=tr[:, 2],
+            mode="lines",
+            name=f"pair_{i+1}",
+        ))
+
+    # Overlay perturbed latent cloud
+    cloud = z_bg[:, :3].numpy()
+    fig.add_trace(go.Scatter3d(
+        x=cloud[:, 0], y=cloud[:, 1], z=cloud[:, 2],
+        mode="markers",
+        name="latent @ t_final",
+        marker=dict(size=2, opacity=0.35),
+    ))
+
+    fig.update_layout(
+        title="Latent geodesics (first 3 dims) with background cloud",
+        scene=dict(xaxis_title="z1", yaxis_title="z2", zaxis_title="z3"),
+        margin=dict(l=0, r=0, t=40, b=0),
+    )
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, filename)
+    plotly_plot(fig, filename=out_path, auto_open=False)
+    print(f"[Eval] Interactive latent 3D plot → {out_path}")
+    return out_path
+
+def get_generation_callback(
+    *,
+    sample_steps: int = 250,
+    sample_count: int = 36,
+    grid_nrow: int | None = None,
+    tag_prefix: str = "Latent2Image",
+):
+    """
+    Returns a callback that:
+      1) samples ẑ from the latent diffusion model in *normalized* space,
+      2) denormalizes with AE buffers (μ,σ),
+      3) decodes and logs a grid.
+
+    Usage:
+        gen_cb = get_generation_callback(sample_steps=250, sample_count=36)
+        gen_cb(writer, model, latent_model, latent_sde, device, save_dir, epoch,
+               ema_latent=latent_ema)
+    """
+    def cb(
+        writer,
+        model,                 # AutoEncoder (must expose normalize/denormalize helpers)
+        latent_model,          # latent score model
+        latent_sde,            # latent SDE object
+        device: torch.device,
+        save_dir: str,
+        epoch: int,
+        *,
+        ema_latent=None,       # optional EMA wrapper for latent_model (has apply_shadow/restore)
+        ema_ae=None            # optional EMA for AE if you want EMA decode during training
+    ) -> str | None:
+        if latent_model is None or latent_sde is None:
+            print("[Gen] No latent diffusion model/SDE; skipping generation.")
+            return None
+
+        # Lazy import to avoid hard dependency in other flows
+        try:
+            from utils.sampling_utils import Algorithm1
+        except Exception as e:
+            print(f"[Gen] Sampling utility not available ({e}); skipping.")
+            return None
+
+        # Put models into eval temporarily; optionally apply EMA weights
+        from contextlib import ExitStack
+        with ExitStack() as stack, torch.no_grad():
+            stack.enter_context(evaluation_mode(latent_model))
+            stack.enter_context(evaluation_mode(model))
+            if ema_latent is not None:
+                ema_latent.apply_shadow()
+            if ema_ae is not None:
+                ema_ae.apply_shadow()
+
+            try:
+                # Score fn as in your eval script
+                score_fn = latent_model.get_score_fn(latent_sde)
+
+                z_dim = getattr(model, "z_dim", None)
+                if z_dim is None:
+                    # fallback: many tiny MLPs store "state_size"
+                    z_dim = int(getattr(latent_model, "state_size", 0))
+                assert z_dim and z_dim > 0, "Could not infer latent dimensionality."
+
+                # Sample in *normalized* latent space
+                z_shape = (int(sample_count), int(z_dim))
+                z_hat = Algorithm1(latent_sde, int(sample_steps), score_fn, z_shape, device, y=None)
+
+                # Denormalize using AE buffers and decode
+                z = model.denormalize_latent(z_hat)
+                out_path = decode_and_save_grid(
+                    decoder=model.decode,
+                    z_samples=z,
+                    eval_dir=save_dir,
+                    writer=writer,
+                    grid_nrow=grid_nrow,
+                    tag=f"{tag_prefix}/Samples",
+                    epoch=epoch,
+                )
+            finally:
+                if ema_latent is not None:
+                    ema_latent.restore()
+                if ema_ae is not None:
+                    ema_ae.restore()
+
+        return out_path
+    return cb
+
+def save_latent_geodesic_2d(
+    *,
+    path_z_list: List[torch.Tensor],   # list[T] of (B, D) tensors
+    z_bg_pert: torch.Tensor,           # (N, D) background cloud at some t_final
+    out_dir: str,
+    filename: str = "latent_geodesics_latent2d.png",
+) -> str:
+    """Static 2D viz of latent geodesics over a perturbed background cloud."""
+    import matplotlib.pyplot as plt
+    traj = torch.stack([pt.detach().cpu() for pt in path_z_list], dim=0)  # (T,B,D)
+    if traj.ndim == 2:  # (T,D) -> (T,1,D)
+        traj = traj.unsqueeze(1)
+    T, B, D = traj.shape
+    if D != 2:
+        print(f"[Eval] D={D} != 2; skipping 2D latent viz.")
+        return ""
+    cloud = z_bg_pert.detach().cpu().numpy()  # (N,2)
+
+    plt.figure(figsize=(6, 6))
+    plt.scatter(cloud[:, 0], cloud[:, 1], s=3, alpha=0.3, label="latent @ t_final")
+
+    for i in range(B):
+        tr = traj[:, i, :2].numpy()
+        plt.plot(tr[:, 0], tr[:, 1], linewidth=1.5, label=f"pair_{i+1}" if B <= 8 else None)
+        # start/end markers
+        plt.scatter(tr[0, 0], tr[0, 1], s=30, marker="o")
+        plt.scatter(tr[-1, 0], tr[-1, 1], s=30, marker="x")
+
+    plt.xlabel("z[0]"); plt.ylabel("z[1]")
+    plt.gca().set_aspect("equal", adjustable="box")
+    if B <= 8:
+        plt.legend(loc="best", fontsize=8)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, filename)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[Geodesics] Saved 2D latent geodesics → {out_path}")
+    return out_path
+
+def _latent_cloud_at_t_with_marginal(z0: torch.Tensor, sde, t: float, seed: int = 123) -> torch.Tensor:
+    """
+    Produce a corrupted latent cloud at time t using the SDE marginal.
+    Deterministic via a local RNG fork; works on both CPU and CUDA and on all
+    torch versions (no use of generator= on randn_like).
+    """
+    device = z0.device
+    t_tensor = torch.tensor(float(t), device=device)
+
+    mean, std = sde.marginal_prob(z0, t_tensor)          # mean: (N,D), std: (N,)
+    std = std.view(-1, *([1] * (mean.dim() - 1)))        # broadcast like in driver
+
+    # deterministic noise without polluting global RNG
+    if seed is not None:
+        if z0.is_cuda:
+            dev_idxs = [z0.device.index] if z0.device.index is not None else [torch.cuda.current_device()]
+        else:
+            dev_idxs = []
+        with torch.random.fork_rng(devices=dev_idxs):    # local, deterministic
+            torch.manual_seed(int(seed))
+            eps = torch.randn_like(mean)
+    else:
+        eps = torch.randn_like(mean)
+
+    return mean + std * eps
+
+
+def save_latent_geodesics_stages_2d(
+    *,
+    stage_paths: list,          # [{'t': float, 'path': [γ0,...,γK]}]
+    z_bg_per_stage: dict,       # {float t: (N,2) tensor}
+    out_dir: str,
+    filename: str = "latent_geodesics_stages_2d.png",
+    order: str = "asc",         # "asc" -> small t → large t (left→right); "desc" for the opposite
+    figsize_unit: float = 3.0,
+    dpi: int = 150,
+    point_size: float = 4.0,
+    alpha: float = 0.8,
+):
+    import os
+    import matplotlib.pyplot as plt
+    import numpy as np
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Determine panel order once, then use it for both clouds and paths.
+    times = [float(d['t']) for d in stage_paths]
+    uniq_times = sorted(set(times))
+    times = uniq_times if order == "asc" else list(reversed(uniq_times))
+
+    # Sanity: ensure we have a cloud for every t we’ll draw
+    for t in times:
+        if float(t) not in z_bg_per_stage:
+            raise ValueError(f"Missing background cloud for t={t:.6f}")
+
+    # Global limits from all clouds
+    all_bg = np.concatenate([z_bg_per_stage[float(t)].detach().cpu().numpy() for t in times], axis=0)
+    xlim = (all_bg[:,0].min(), all_bg[:,0].max())
+    ylim = (all_bg[:,1].min(), all_bg[:,1].max())
+    pad_x = 0.05 * (xlim[1] - xlim[0]); pad_y = 0.05 * (ylim[1] - ylim[0])
+    xlim = (xlim[0] - pad_x, xlim[1] + pad_x)
+    ylim = (ylim[0] - pad_y, ylim[1] + pad_y)
+
+    # Group raw paths by time (exact float key)
+    from collections import defaultdict
+    paths_by_t = defaultdict(list)
+    for item in stage_paths:
+        paths_by_t[float(item['t'])].append(item['path'])
+
+    S = len(times)
+    fig, axes = plt.subplots(1, S, figsize=(S * figsize_unit, figsize_unit), dpi=dpi)
+    if S == 1:
+        axes = [axes]
+
+    for ax, t in zip(axes, times):
+        z_bg = z_bg_per_stage[float(t)]
+        ax.scatter(z_bg[:,0].detach().cpu().numpy(),
+                   z_bg[:,1].detach().cpu().numpy(),
+                   s=point_size, alpha=alpha)
+
+        # overlay all B paths for this stage
+        for path in paths_by_t[float(t)]:
+            Kp1 = len(path)
+            B = path[0].shape[0]
+            for b in range(B):
+                xy = torch.stack([path[k][b] for k in range(Kp1)], dim=0).detach().cpu().numpy()
+                ax.plot(xy[:,0], xy[:,1], linewidth=2.0, alpha=0.95)
+                ax.scatter([xy[0,0], xy[-1,0]], [xy[0,1], xy[-1,1]], s=12)
+
+        ax.set_title(f"t = {t:.4f}")
+        ax.set_xlim(*xlim); ax.set_ylim(*ylim)
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_xlabel("dim 0"); ax.set_ylabel("dim 1")
+
+    fig.tight_layout()
+    out_path = os.path.join(out_dir, filename)
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+# ───────────────── decode geodesic trajectories into grid ─────────────────
+
+@torch.no_grad()
+def decode_latent_path_and_save_grid(
+    *,
+    path_z_list: List[torch.Tensor],   # [T] of (B, D)
+    decoder,                           # AE.decode
+    eval_dir: str,
+    writer: Optional[SummaryWriter] = None,
+    tag: str = "LatentGeodesics/DecodedGrid",
+    filename: str = "latent_geodesics_grid.png",
+) -> str:
+    """
+    Make a B×T grid: each row is one pair's trajectory, columns are path nodes.
+    Saves the PNG and logs to TensorBoard if writer is provided.
+    """
+    # decode each time step
+    decoded_steps = [decoder(z).detach().cpu() for z in path_z_list]  # list[T] of (B, C, H, W)
+    T = len(decoded_steps)
+    B = decoded_steps[0].size(0)
+    tiles = []
+    for i in range(B):
+        for t in range(T):
+            tiles.append(decoded_steps[t][i])
+
+    grid = vutils.make_grid(tiles, nrow=T, normalize=True, scale_each=True)
+    os.makedirs(eval_dir, exist_ok=True)
+    out_path = os.path.join(eval_dir, filename)
+    vutils.save_image(grid, out_path)
+
+    if writer is not None:
+        writer.add_image(tag, grid, 0)
+
+    print(f"[Eval] Saved latent geodesics grid → {out_path}  (rows={B}, cols={T})")
+    return out_path
+
+
+# ──────────────── convenience: perturb latents at a single time ───────────
+
+@torch.no_grad()
+def perturb_latents_at_time(z: torch.Tensor, sde, t_val: float) -> torch.Tensor:
+    """Apply SDE marginal noise at diffusion time t_val to latent points z."""
+    t = torch.tensor(float(t_val), device=z.device, dtype=z.dtype)
+    mean, std = sde.marginal_prob(z, t)
+    xi = torch.randn_like(z)
+    # Broadcast std across non-batch dims if needed
+    std_view = std.view(-1, *([1] * (z.dim() - 1))) if std.ndim == 1 else std
+    return mean + std_view * xi

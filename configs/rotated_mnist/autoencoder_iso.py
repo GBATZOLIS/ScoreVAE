@@ -8,14 +8,14 @@ def get_config():
 
     # logging / folders
     cfg.base_log_dir    = "./results"
-    cfg.experiment      = "rotmnist/ae"
+    cfg.experiment      = "rotmnist/iso_ae"
     cfg.tensorboard_dir = f"{cfg.base_log_dir}/{cfg.experiment}/training_logs"
     cfg.checkpoint_dir  = f"{cfg.base_log_dir}/{cfg.experiment}/checkpoints"
     cfg.eval_dir        = f"{cfg.base_log_dir}/{cfg.experiment}/eval"
 
     # training
     cfg.training = tr = ml_collections.ConfigDict()
-    tr.device               = "cuda:0"
+    tr.device               = "cuda:1"
     tr.epochs               = 150
     tr.checkpoint_frequency = 10
     tr.patience_epochs      = 50
@@ -66,8 +66,8 @@ def get_config():
     loss.beta_kl         = 1e-3                      # β-VAE style (set to 1.0 for standard ELBO)
 
     # Local isometry (simple, Euclidean by default)
-    loss.enc_iso_weight         = 0.               # encoder local isometry (Euclidean)
-    loss.dec_iso_weight         = 0.               # decoder local isometry (Euclidean)
+    loss.enc_iso_weight         = 1.               # encoder local isometry (Euclidean)
+    loss.dec_iso_weight         = 1.               # decoder local isometry (Euclidean)
     loss.num_v                  = 1                  # # of directions for JVP/VJP-based regs
     loss.dec_iso_detach_encoder = True               # typically keep True
 
