@@ -3,7 +3,7 @@
 # Optimizer: Riemannian Adam (+ Armijo LS). Metric: Jacobian (J^T J + λI).
 CONFIG = {
     "random_seed": 42,
-    "num_pairs": 25,
+    "num_pairs": 100,
 
     # diffusion schedule (descending = coarse → fine)
     "time_schedule": [0.13, 0.12, 0.11, 0.10, 0.09, 0.08, 0.07, 0.06, 0.05, 0.04], #[0.18, 0.17, 0.16, 0.15, 0.14, 0.13, 0.12, 0.11, 0.10], #[0.18, 0.17, 0.16, 0.15, 0.14, 0.13, 0.12, 0.11, 0.09, 0.07], #[0.18, 0.17, 0.16, 0.15, 0.14, 0.13, 0.11, 0.09, 0.07, 0.05, 0.04],
@@ -56,7 +56,8 @@ CONFIG = {
     "cg_max_iter": 4,
 
     # ── NEW: initializer controls ────────────────────────────────────
-    "init_method": "tproject",        # {"tproject","linear"}
+    "init_method": "tproject",        # {"tproject", "linear"}
+    "init_nseeds": 20, 
     "init_add_noise": True,           # add SAME ξ to interiors after projecting back to time t
 
     # (optional) multi-GPU sharding for single path

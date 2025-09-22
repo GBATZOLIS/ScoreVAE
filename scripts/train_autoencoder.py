@@ -487,7 +487,13 @@ def train(cfg):
     # callbacks
     recon_cb  = get_reconstruction_callback()
     latent_cb = get_latent_scatter_callback(num_batches=20, max_points=5000, mode="both")
-    latent_norm_cb = get_update_latent_normalizer_callback(min_count=5000, max_batches=None, tag_prefix="AE")
+    latent_norm_cb = get_update_latent_normalizer_callback(
+        min_count=getattr(cfg.training, "latent_norm_min_count", 4000),
+        max_batches=getattr(cfg.training, "latent_norm_max_batches", None),
+        tag_prefix="AE",
+        use_amp=True,
+    )
+
 
     # AMP setup
     use_bf16 = torch.cuda.is_bf16_supported()
@@ -630,15 +636,13 @@ def train(cfg):
         update_norm_freq = getattr(cfg.training, "update_norm_frequency", 1)
 
         if latent_model is not None and ((epoch + 1) % update_norm_freq == 0):
-            latent_norm_cb(val_loader, writer if ddp_rank() == 0 else _NullWriter(), ae_mod, device, epoch)
-            # Broadcast updated buffers so all ranks agree
-            if ddp_is_active():
-                with torch.no_grad():
-                    mu = ae_mod.latent_norm_mean.clone().to(device)
-                    sd = ae_mod.latent_norm_std.clone().to(device)
-                    dist.broadcast(mu, src=0)
-                    dist.broadcast(sd, src=0)
-                    ae_mod.set_latent_normalization(mu, sd)
+            latent_norm_cb(
+                val_loader,
+                writer if ddp_rank() == 0 else _NullWriter(),  # fine to pass NullWriter
+                ae_mod,
+                device,
+                epoch
+            )
 
         # ---- visualization (rank 0) ----
         if ddp_rank() == 0 and ((epoch + 1) % cfg.training.vis_frequency == 0):

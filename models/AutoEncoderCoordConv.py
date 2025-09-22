@@ -211,7 +211,7 @@ class ConvEncoderClassicCC(nn.Module):
     def __init__(self, in_ch: int, z_dim: int, base: int, levels: int,
                  groups_gn: int, use_coordconv_encoder: bool,
                  grid_generator: CoordinateGridGenerator,
-                 downsample_mode: str = "blur", blur_filt_size: int = 5):
+                 downsample_mode: str = "blur", blur_filt_size: int = 5, img_size: int = 32):
         super().__init__()
         assert downsample_mode in ("avg", "blur")
         self.levels, self.use_cc = levels, use_coordconv_encoder
@@ -235,7 +235,7 @@ class ConvEncoderClassicCC(nn.Module):
                 self.downs.append(BlurPool2d(out_c, filt_size=blur_filt_size))
         
         # We need image_size to calculate the final flat dimension
-        s = 32 // (2 ** levels) # Assuming 32x32 for now, a bit fragile but matches original logic
+        s = img_size // (2 ** levels) # Assuming 32x32 for now, a bit fragile but matches original logic
         flat_dim = chs[levels] * s * s
         self.z_proj = nn.Linear(flat_dim, z_dim)
         
@@ -382,6 +382,7 @@ class AutoEncoderCoordConv(nn.Module):
             grid_generator=self.grid_generator,
             downsample_mode=str(getattr(m, "encoder_downsample_mode", "blur")),
             blur_filt_size=int(getattr(m, "encoder_blur_filt_size", 5)),
+            img_size=int(m.image_size)
         )
 
         self.decoder = ConvDecoderClassicCC(

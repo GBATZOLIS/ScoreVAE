@@ -48,7 +48,7 @@ def get_config():
 
     # ---------------- model ----------------
     cfg.model = model = ml_collections.ConfigDict()
-    model.network         = "AutoEncoderCoordConv"   # <- classic AE + CoordConv
+    model.network         = "AutoEncoderCoordConv" 
     model.in_channels     = data.channels
     model.out_channels    = data.channels
     model.image_size      = data.image_size
@@ -58,7 +58,7 @@ def get_config():
     model.groups_gn       = 8
     model.ema_decay       = 0.999
     model.compile         = True
-    model.checkpoint      = 'AE_epoch_9_loss_0.003.pth'
+    model.checkpoint      = 'AE_last_EMA.pth'
     # CoordConv toggles
     model.use_coordconv_encoder              = False   # off by default
     model.use_coordconv_decoder_bottleneck   = True    # on at lowest-res stage

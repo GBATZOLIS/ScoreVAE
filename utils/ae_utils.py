@@ -109,62 +109,88 @@ def evaluation_mode(model):
 
 # ────────────────────────── logging callbacks ──────────────────────────
 
+
 def get_update_latent_normalizer_callback(
     *,
-    min_count: int = 6000,
+    min_count: int = 4000,
     max_batches: int | None = None,
     tag_prefix: str = "AE",
     eps: float = 1e-6,
+    use_amp: bool = True,   # autocast during encode
 ):
     """
-    End-of-epoch callback (DDP-aware):
-      • Each rank encodes at least ~min_count/world_size latents from its `val_loader` shard
-      • All latents are gathered across ranks
-      • Global per-dim μ, σ are computed on rank 0 and broadcast to all ranks
-      • Calls model.set_latent_normalization(μ, σ) on every rank
-      • Logs quick summaries to TensorBoard on rank 0
+    End-of-epoch callback (DDP-aware, streaming, NO EMA):
+      • Each rank encodes ~min_count/world_size examples from val_loader.
+      • Locally accumulate S=sum(z), Q=sum(z^2), n in float64 (no storing latents).
+      • All-reduce S, Q, n; compute global μ, σ on every rank (no all_gather).
+      • Calls model.set_latent_normalization(μ, σ).
     """
     def cb(val_loader, writer, model, device, epoch):
         mm = _unwrap_module(model)
         ws = _get_world_size()
-        # ensure total >= min_count; per-rank target rounded up
         local_min = int(math.ceil(min_count / max(ws, 1)))
-        with evaluation_mode(mm), torch.no_grad():
-            Z_local = encode_latents_from_loader(
-                model=mm, loader=val_loader, device=device,
-                min_count=local_min, max_batches=max_batches
-            ).float()  # (N_local, d)
 
-        # gather across ranks
-        Z_all = _all_gather_variable_batch(Z_local, dim=0)  # (N_total, d) on all ranks
+        # Accumulators (float64 for stability)
+        S = None
+        Q = None
+        n_local = torch.zeros((), dtype=torch.float64, device=device)
 
-        # compute on rank0 then broadcast
-        if _is_primary():
-            mu = Z_all.mean(dim=0)              # (d,)
-            sd = Z_all.std(dim=0, unbiased=False).clamp_min(eps)
-        else:
-            d = Z_all.size(1)
-            mu = torch.zeros(d, device=device, dtype=Z_all.dtype)
-            sd = torch.ones(d,  device=device, dtype=Z_all.dtype)
-        _broadcast_(mu)
-        _broadcast_(sd)
+        # AMP context for faster encode
+        amp_ctx = (
+            torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if (use_amp and device.type == "cuda")
+            else contextmanager(lambda: (yield))()
+        )
 
-        mm.set_latent_normalization(mu.to(device), sd.to(device), eps=eps)
+        b = 0
+        with evaluation_mode(mm), torch.inference_mode(), amp_ctx:
+            for batch in val_loader:
+                if (max_batches is not None and b >= max_batches) or (n_local.item() >= local_min):
+                    break
+                x = batch[0].to(device, non_blocking=True)
+                z = mm.encode(x)  # (B, d)
 
-        # Logging (rank 0 only)
+                if S is None:
+                    d = z.shape[1]
+                    S = torch.zeros(d, dtype=torch.float64, device=device)
+                    Q = torch.zeros(d, dtype=torch.float64, device=device)
+
+                z64 = z.to(torch.float64)
+                S += z64.sum(dim=0)
+                Q += (z64 * z64).sum(dim=0)
+                n_local += z.shape[0]
+                b += 1
+
+        if S is None:
+            raise RuntimeError("[LatentNormStreaming] No validation data was processed.")
+
+        # All-reduce partials
+        if _dist_is_initialized():
+            torch.distributed.all_reduce(S, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(Q, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(n_local, op=torch.distributed.ReduceOp.SUM)
+
+        n = max(float(n_local.item()), 1.0)
+        mu_64 = S / n
+        var_64 = (Q / n) - mu_64 * mu_64
+        var_64.clamp_(min=(eps ** 2))
+        sd_64 = torch.sqrt(var_64)
+
+        mu = mu_64.to(dtype=torch.float32)
+        sd = sd_64.to(dtype=torch.float32)
+
+        # Set identical μ/σ on every rank
+        mm.set_latent_normalization(mu, sd, eps=eps)
+
         if _writer_ok(writer):
-            try:
-                writer.add_scalar(f"{tag_prefix}/latent_norm/mean_abs_mean", float(mu.abs().mean().item()), epoch)
-                writer.add_scalar(f"{tag_prefix}/latent_norm/mean_std",      float(sd.mean().item()), epoch)
-                if mu.numel() <= 64:  # avoid huge histograms
-                    writer.add_histogram(f"{tag_prefix}/latent_norm/mu_hist", mu, epoch)
-                    writer.add_histogram(f"{tag_prefix}/latent_norm/sd_hist", sd, epoch)
-            except Exception:
-                pass
+            writer.add_scalar(f"{tag_prefix}/latent_norm/mean_abs_mean", float(mu.abs().mean().item()), epoch)
+            writer.add_scalar(f"{tag_prefix}/latent_norm/mean_std",      float(sd.mean().item()), epoch)
 
         if _is_primary():
-            print(f"[LatentNorm] epoch {epoch}: |μ|_mean={mu.abs().mean():.3f}  σ_mean={sd.mean():.3f}")
+            print(f"[LatentNormStreaming] epoch {epoch}: n={int(n)}  |μ|_mean={mu.abs().mean():.3f}  σ_mean={sd.mean():.3f}")
+
     return cb
+
 
 def get_reconstruction_callback():
     """Returns a callback that logs original and reconstructed images (rank 0 only in DDP)."""

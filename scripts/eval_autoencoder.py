@@ -478,8 +478,11 @@ def eval_autoencoder(
                 devices=geo.get("devices", None),
                 post_denoise_fn=None,
                 endpoint_mode=str(geo.get("endpoint_mode", "clean")),
-                fixed_noise=None,  # relevant only if endpoint_mode=="noisy"
-                init_nseeds=20,
+                fixed_noise=None,  # relevant only if endpoint_mode=="noisy",
+                
+                init_method = str(geo.get("init_method", "tproject")),
+                init_nseeds= int(geo.get("init_nseeds", 20)),
+                init_add_noise  =bool(geo.get("init_add_noise", True)),
             )
 
             # ── FIX: realized frames are number of path knots, not batch size

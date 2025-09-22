@@ -36,7 +36,7 @@ mp.set_start_method("spawn", force=True)
 # ──────────────────────────────────────────────────────────────────────────
 # project imports
 # -------------------------------------------------------------------------
-from data.data_utils_fast import get_dataloaders  # fast dataloader implementation
+from data.data_utils_ddp import get_dataloaders  # fast dataloader implementation
 from models import get_model
 from sde import configure_sde
 from loss import get_loss_fn

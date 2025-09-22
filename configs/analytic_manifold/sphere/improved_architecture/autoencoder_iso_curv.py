@@ -6,7 +6,7 @@ def get_config():
     cfg = ml_collections.ConfigDict()
     cfg.random_seed   = 42
     cfg.base_log_dir  = "./results"
-    cfg.experiment    = "analytic_manifold/sphere/improved_architecture/autoencoder_iso_metric_smoothness_MECAE"
+    cfg.experiment    = "analytic_manifold/sphere/improved_architecture/autoencoder_iso_curv"
     cfg.tensorboard_dir = f"{cfg.base_log_dir}/{cfg.experiment}/training_logs"
     cfg.checkpoint_dir  = f"{cfg.base_log_dir}/{cfg.experiment}/checkpoints"
     cfg.eval_dir        = f"{cfg.base_log_dir}/{cfg.experiment}/eval"
@@ -58,7 +58,8 @@ def get_config():
     model.groups_gn       = 8
     model.ema_decay       = 0.999
     model.compile         = True
-    model.checkpoint      = 'AE_epoch_49_loss_0.001.pth'
+    model.checkpoint      = 'AE_last_EMA.pth'
+    
     # CoordConv toggles
     model.use_coordconv_encoder              = False   # off by default
     model.use_coordconv_decoder_bottleneck   = True    # on at lowest-res stage
@@ -92,15 +93,15 @@ def get_config():
     loss.beta_kl          = 1e-3
 
     # local isometry regs
-    loss.enc_iso_weight   = 5e-3 #0.04
-    loss.dec_iso_weight   = 5e-3 #0.04
+    loss.enc_iso_weight   = 5e-3 
+    loss.dec_iso_weight   = 5e-3 
     loss.num_v            = 1
 
     
 
 
     # --- MECAE (extrinsic) ---
-    loss.curvature_weight = 4e-4
+    loss.curvature_weight = 7.5e-5
     loss.curvature = curv = ml_collections.ConfigDict()
     curv.mode              = "mecae"
     curv.target            = "both"        # "encoder" | "decoder" | "both"
@@ -115,7 +116,7 @@ def get_config():
     curv.every_n_steps     = 3
 
     # --- Metric Smoothness (decoder pullback metric invariants) ---
-    loss.metric_smooth_weight = 1e-3   # start small; 1e-4–3e-3 typical
+    loss.metric_smooth_weight = 0.0   # start small; 1e-4–3e-3 typical
     loss.metric_smoothness = ms = ml_collections.ConfigDict()
     ms.K_w               = 1           # 1–2; raise to 2 if logs look noisy
     ms.use_rademacher    = True
