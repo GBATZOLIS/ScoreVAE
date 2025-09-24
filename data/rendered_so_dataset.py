@@ -223,6 +223,91 @@ def _worker_render(rank:int, device:str, chunk, mesh_path:str, aa, channels:int,
     if imgs:
         queue.put((torch.cat(imgs,0), torch.cat(rots,0)))
 
+# ───────────────────── Worker renderer (indexed, preserves order) ─────────── #
+def _worker_render_indexed(rank:int, device:str, chunk_indices, chunk_rots, mesh_path:str, aa, channels:int,
+                           queue, flush:int=1024, render_batch:int=32, show_pbar:bool=False):
+    """
+    Same rendering as _worker_render, but returns (idx_batch, img_batch) so caller
+    can place frames into the correct positions. This preserves global ordering.
+    """
+    torch.manual_seed(17 + rank)
+    dev = torch.device(device)
+
+    mesh0 = load_objs_as_meshes([mesh_path], device=dev)
+    mesh0 = _normalise_mesh(mesh0)
+    if mesh0.textures is None:
+        mesh0.textures = TexturesVertex(
+            verts_features=torch.ones_like(mesh0.verts_packed(), dtype=torch.float32)[None] * 0.7
+        )
+
+    renderer = _build_renderer(aa['render'], aa['blur'], aa['faces'], dev)
+    renderer.shader.materials = Materials(device=dev, specular_color=((0.9,0.9,0.9),), shininess=100.0)
+
+    V0 = mesh0.verts_padded()
+    F0 = mesh0.faces_padded()
+    C0 = mesh0.textures.verts_features_padded()
+
+    def batched(seq, n):
+        for i in range(0, len(seq), n):
+            yield seq[i:i+n]
+
+    imgs, ids = [], []
+    pack_size = int(render_batch)
+
+    pbar = tqdm(total=len(chunk_rots), desc=f"Worker {rank}", position=rank+1, leave=False,
+                dynamic_ncols=True, disable=not show_pbar)
+
+    for idx_pack, R_pack in zip(batched(list(chunk_indices), pack_size), batched(list(chunk_rots), pack_size)):
+        Rs = torch.stack([x.to(dev) for x in R_pack], 0)  # (B,3,3)
+        start = 0
+        while start < Rs.size(0):
+            cur_B = min(pack_size, Rs.size(0) - start)
+            sub_Rs = Rs[start:start+cur_B]
+
+            try:
+                verts_list = []
+                RV = Rotate(sub_Rs, device=dev).transform_points(V0.expand(cur_B, -1, -1))
+                for i in range(cur_B):
+                    verts_list.append(RV[i])
+
+                mesh_batch = Meshes(
+                    verts=verts_list,
+                    faces=[F0[0]] * cur_B,
+                    textures=TexturesVertex(verts_features=[C0[0]] * cur_B),
+                )
+
+                # camera-to-world rotations for lighting
+                R_view = sub_Rs.transpose(1,2).contiguous()
+                renderer.shader.lights = _build_lights_batch(R_view, dev)
+
+                hi = renderer(mesh_batch)[..., :3].permute(0,3,1,2)   # (cur_B,3,Hhi,Whi)
+                lo = _downsample(hi, aa)                              # (cur_B,C,H,W)
+                if channels == 1:
+                    lo = lo.mean(1, keepdim=True)
+
+                imgs.append((_to_srgb(lo) * 255).byte().cpu())
+                ids.append(torch.tensor(idx_pack[start:start+cur_B], dtype=torch.long))
+
+                start += cur_B
+                if show_pbar: pbar.update(cur_B)
+
+                # periodic flush
+                if sum(x.size(0) for x in imgs) >= flush:
+                    queue.put((torch.cat(ids, 0), torch.cat(imgs, 0)))
+                    imgs, ids = [], []
+
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if cur_B == 1:
+                    raise
+                pack_size = max(1, cur_B // 2)
+                continue
+
+    if show_pbar: pbar.close()
+    if imgs:
+        queue.put((torch.cat(ids, 0), torch.cat(imgs, 0)))
+
+
 # ───────────────────── Dataset Class ────────────────────────── #
 class RenderedSO3Dataset(Dataset):
     """
@@ -413,6 +498,69 @@ class RenderedSO3Dataset(Dataset):
                        queue, flush=len(tasks), render_batch=self.render_batch, show_pbar=True)
         imgs, rots = queue.get()
         self.data = imgs.float() / 255.; self.rotmats = rots.float()
+    
+    # ---------- dataset-style MP renderer for arbitrary rotations ----------
+    def _render_rotations_dataset_style(self, R_obj_flat: torch.Tensor, show_pbar: bool = False) -> torch.Tensor:
+        """
+        Render rotations using the SAME pipeline as dataset generation:
+        - Multi-process across devices from _visible_cuda()
+        - MultiLight SoftPhong with per-view lights
+        - AA settings from self._aa, faces_per_pixel=self._aa['faces']
+        Returns float tensor in [0,1], shape (N,C,H,W), order preserved.
+        """
+        N = R_obj_flat.size(0)
+        if N == 0:
+            return torch.empty(0, self.channels, self.H, self.W)
+
+        # Single-process serial path (keeps exact worker code)
+        if self._default_workers() <= 1:
+            ctx = mp.get_context("spawn")
+            queue = ctx.Queue()
+            _worker_render(
+                0, self.device, list(R_obj_flat), self.mesh_path, self._aa, self.channels,
+                queue, flush=N, render_batch=self.render_batch, show_pbar=True
+            )
+            imgs, _ = queue.get()
+            return imgs.float() / 255.
+
+        # Multi-process path with order preservation
+        devs = self._visible_cuda() if ("cuda" in self.device) else [self.device]
+        n_proc = min(self.n_workers, len(devs))
+        chunk = math.ceil(N / n_proc)
+        idx_chunks = [list(range(i, min(i+chunk, N))) for i in range(0, N, chunk)]
+        rot_chunks = [ [R_obj_flat[j] for j in ich] for ich in idx_chunks ]
+
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue(maxsize=2*n_proc)
+        procs = []
+
+        for rk, (ich, rch) in enumerate(zip(idx_chunks, rot_chunks)):
+            p = ctx.Process(target=_worker_render_indexed, kwargs=dict(
+                rank=rk, device=devs[rk % len(devs)], chunk_indices=ich, chunk_rots=rch,
+                mesh_path=self.mesh_path, aa=self._aa, channels=self.channels, queue=queue,
+                flush=1024, render_batch=self.render_batch, show_pbar=False
+            ))
+            p.start(); procs.append(p)
+
+        frames_u8 = torch.empty((N, self.channels, self.H, self.W), dtype=torch.uint8)
+        rec = 0
+        with tqdm(total=N, desc="Rendering (dataset-style MP)", dynamic_ncols=True, disable=not show_pbar) as pbar:
+            while rec < N:
+                try:
+                    idx_batch, img_batch = queue.get(timeout=10)
+                    frames_u8[idx_batch] = img_batch
+                    rec += img_batch.size(0)
+                    if show_pbar: pbar.update(img_batch.size(0))
+                except QueueEmpty:
+                    if all(not p.is_alive() for p in procs):
+                        break
+
+        for p in procs: p.join()
+        if rec < N:
+            missing = N - rec
+            raise RuntimeError(f"Geodesic render incomplete: missing {missing} frames")
+
+        return frames_u8.float() / 255.
 
     # ---------- Dataset Interface ----------
     def __len__(self): return self.data.size(0)
@@ -485,41 +633,37 @@ class RenderedSO3Dataset(Dataset):
         u = F.normalize(torch.cross(f, r, dim=-1), dim=-1)
         return torch.stack([r, u, f], dim=-1)            # columns are axes
 
-    # True SO(3) geodesic between P,Q
+    # True SO(3) geodesic between P,Q  → dataset-style renderer
     def _compute_geodesic_so3(self, P: torch.Tensor, Q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        dev = P.device
         B, T = P.size(0), t.numel()
-        N = B * T
         # R(t) = P * exp(t * log(P^T Q))
         A = self._so3_log_batch(P.transpose(-2, -1) @ Q)  # (B,3,3)
         Rts = P.unsqueeze(1) @ self._so3_exp_batch(A.unsqueeze(1) * t.view(1, T, 1, 1))
-        Rts_flat = Rts.reshape(N, 3, 3).contiguous()
-        return self._render_rotations(Rts_flat, dev).view(B, T, self.channels, self.H, self.W)
+        R_obj_flat = Rts.reshape(B * T, 3, 3).contiguous().cpu()
+        frames = self._render_rotations_dataset_style(R_obj_flat, show_pbar=True)
+        return frames.view(B, T, self.channels, self.H, self.W)
 
-    # S^2 zero-roll geodesic (existing behavior)
+    # S^2 zero-roll geodesic → dataset-style renderer
     def _compute_geodesic_s2_zeroroll(self, P: torch.Tensor, Q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        dev = P.device
         B, T = P.size(0), t.numel()
-        N = B * T
-
         Rv0 = P.transpose(-2, -1)
         Rv1 = Q.transpose(-2, -1)
-        z_cam = torch.tensor([0.0, 0.0, -1.0], device=dev)
+        z_cam = torch.tensor([0.0, 0.0, -1.0], device=P.device)
         n0 = F.normalize((Rv0 @ z_cam.unsqueeze(-1)).squeeze(-1), dim=-1)
         n1 = F.normalize((Rv1 @ z_cam.unsqueeze(-1)).squeeze(-1), dim=-1)
-        n_t = self._s2_geodesic_directions(n0, n1, t).reshape(N,3)
-        R_view_flat = self._camera_view_from_direction(n_t)
-        R_obj_flat = R_view_flat.transpose(1,2).contiguous()
-        return self._render_rotations(R_obj_flat, dev).view(B, T, self.channels, self.H, self.W)
+        n_t = self._s2_geodesic_directions(n0, n1, t).reshape(B*T,3)
 
-    # NEW: S^2 axis-angle geodesic (parameter geodesic on S^2)
+        # build camera-to-world with ZERO roll, then object rotation = R_view^T
+        R_view_flat = self._camera_view_from_direction(n_t)
+        R_obj_flat = R_view_flat.transpose(1,2).contiguous().cpu()
+        frames = self._render_rotations_dataset_style(R_obj_flat, show_pbar=True)
+        return frames.view(B, T, self.channels, self.H, self.W)
+
+    # NEW: S^2 axis-angle geodesic (parameter geodesic on S^2) → dataset-style renderer
     def _compute_geodesic_s2_axisangle(self, P: torch.Tensor, Q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         dev = P.device
         B, T = P.size(0), t.numel()
-        N = B * T
 
-        # Extract axis from rotation: for alpha∈(0,π) fixed, axis is eigenvector of R with eigenvalue 1.
-        # Numerically: (R - R^T) = 2*sin(alpha)*[n]_x  ⇒ n from its off-diagonals.
         def _axis_from_R(R: torch.Tensor) -> torch.Tensor:
             S = R - R.transpose(-2, -1)
             nx = (S[...,2,1] - S[...,1,2]) / 2
@@ -530,11 +674,12 @@ class RenderedSO3Dataset(Dataset):
 
         n0 = _axis_from_R(P)  # (B,3)
         n1 = _axis_from_R(Q)  # (B,3)
-        n_t = self._s2_geodesic_directions(n0, n1, t).reshape(N,3)
+        n_t = self._s2_geodesic_directions(n0, n1, t.to(dev)).reshape(B*T,3)
 
         alpha = torch.tensor(self.alpha_rad, device=dev)
-        R_obj_flat = _exp_axis_angle(n_t, alpha)  # (N,3,3)
-        return self._render_rotations(R_obj_flat, dev).view(B, T, self.channels, self.H, self.W)
+        R_obj_flat = _exp_axis_angle(n_t, alpha).cpu()
+        frames = self._render_rotations_dataset_style(R_obj_flat, show_pbar=True)
+        return frames.view(B, T, self.channels, self.H, self.W)
 
     # Shared micro-batch renderer for a list of rotations (with progress)
     def _render_rotations(self, R_obj_flat: torch.Tensor, dev: torch.device) -> torch.Tensor:

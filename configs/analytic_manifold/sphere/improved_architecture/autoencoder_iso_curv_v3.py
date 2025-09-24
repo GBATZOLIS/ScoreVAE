@@ -1,12 +1,12 @@
-# configs/rendered_so_dataset/autoencoder_s2_axisangle_64x64_gray.py
+# configs/analytic/autoencoder_curv_iso.py
 import ml_collections
 from math import ceil
 
 def get_config():
     cfg = ml_collections.ConfigDict()
     cfg.random_seed   = 42
-    cfg.base_log_dir  = "./results/teapot_sphere"
-    cfg.experiment    = "autoencoder"
+    cfg.base_log_dir  = "./results"
+    cfg.experiment    = "analytic_manifold/sphere/improved_architecture/autoencoder_iso_curv_v3"
     cfg.tensorboard_dir = f"{cfg.base_log_dir}/{cfg.experiment}/training_logs"
     cfg.checkpoint_dir  = f"{cfg.base_log_dir}/{cfg.experiment}/checkpoints"
     cfg.eval_dir        = f"{cfg.base_log_dir}/{cfg.experiment}/eval"
@@ -24,70 +24,66 @@ def get_config():
     # ---------------- data ----------------
     cfg.data = data = ml_collections.ConfigDict()
     data.device        = "cuda"
-    data.dataset       = "rendered_so_dataset"   # << switch to rendered dataset
-    data.mesh_path     = "datasets/meshes/teapot.obj"
-    data.image_size    = 64
-    data.channels      = 1                       # << grayscale
+    data.dataset       = "analytic_manifold_dataset"  
+    data.image_size    = 32
+    data.channels      = 3                              # RGB by default (set 1 for gray)
     data.data_samples  = 100_000
-    data.ambient_dim   = data.channels * data.image_size * data.image_size  # 4096
-    data.dataset_path  = "datasets/teapot_s2axis_gray64.pt"
+    data.gen_batch     = 4096
+    data.ambient_dim   = data.channels * data.image_size * data.image_size
+    data.dataset_path  = "datasets/cache/analytic_S2_32x32_rgb.pt"  # or T^2 path
     data.overwrite_cache = False
-    data.batch_size    = 128
-    data.n_workers     = 4
+    data.batch_size    = 256
+    data.n_workers     = 8
     data.shape         = [data.channels, data.image_size, data.image_size]
 
-    # Submanifold (homeomorphic to S^2)
-    data.manifold_dim  = 3
-    data.submanifold   = "s2_axisangle"
-    data.axis_angle_deg = 90.0
-
-    # No grid sampling (kept for completeness / parity with parser)
-    data.azim_step     = None
-    data.elev_step     = None
-    data.roll_step     = None
+    # Manifold selector and (optional) grid
+    #   manifold: "s2" or "torus"
+    data.manifold      = "s2"        # change to "torus" for the flat torus
+    # S^2 grid (set both to enable grid; otherwise random sampling)
+    data.azim_step     = None        # degrees, e.g. 6.0
+    data.elev_step     = None        # degrees, e.g. 6.0
+    # T^2 grid (set both to enable grid; otherwise random sampling)
+    data.alpha_step    = None        # degrees, e.g. 6.0
+    data.beta_step     = None        # degrees, e.g. 6.0
 
     # ---------------- model ----------------
     cfg.model = model = ml_collections.ConfigDict()
     model.network         = "AutoEncoderCoordConv"
     model.in_channels     = data.channels
     model.out_channels    = data.channels
-    model.image_size      = data.image_size      # used by decoder; encoder needs the 1-line fix noted above
-    model.latent_dim      = 3                    # keep 3D (room for isometry/curvature regs on S^2 texture)
+    model.image_size      = data.image_size
+    model.latent_dim      = 3
     model.base_channels   = 32
-    model.num_down_levels = 3                    # 64 -> 32 -> 16 -> 8 spatial
+    model.num_down_levels = 3
     model.groups_gn       = 8
     model.ema_decay       = 0.999
     model.compile         = True
-    model.checkpoint      = 'AE_last_EMA.pth'
+    model.checkpoint      = None
 
     # CoordConv toggles
-    model.use_coordconv_encoder              = False
-    model.use_coordconv_decoder_bottleneck   = True
-    model.use_coordconv_decoder_all_levels   = False
+    model.use_coordconv_encoder              = False   # off by default
+    model.use_coordconv_decoder_bottleneck   = True    # on at lowest-res stage
+    model.use_coordconv_decoder_all_levels   = False   # off by default
     model.decoder_upsample_mode              = 'resize_conv'
     model.output_activation                  = 'linear'
     model.deconv_bilinear_init               = True
-
-    # Fourier features (carry over)
-    model.use_fourier_features   = False
-    model.fourier_num_freqs      = 6
-    model.fourier_max_freq_log2  = 5
-    model.fourier_include_self   = True
-
+    # Enable Fourier features and set recommended defaults
+    model.use_fourier_features = True
+    model.fourier_num_freqs = 6       # More bands give more capacity for detail. 6-10 is a good range.
+    model.fourier_max_freq_log2 = 5   # Max freq of 2^6=64. For 32px images, this captures super-pixel frequencies.
+    model.fourier_include_self = True # Always recommended to keep the base [-1, 1] coordinates.
     # Geometry-friendly stem
     model.use_orthogonal_stem   = False
-    model.stem_reflections      = 4
-    model.stem_init_alpha       = 0.1
-
-    # Spectral norm (match your prior setting; decoder constructor defaults to True otherwise)
-    model.use_spectral_norm               = False
-    model.use_spectral_norm_when_compiled = False
-
-    # Encoder anti-aliasing
+    model.stem_reflections      = 4        # 2–6 are good; 4 is a sweet spot
+    model.stem_init_alpha       = 0.1      # start ~identity (sigmoid≈0)
+    # Spectral norm (reduce Lipschitz/metric variation)
+    # Keep True by default, but disable while compiling unless you explicitly opt in.
+    model.use_spectral_norm             = False
+    model.use_spectral_norm_when_compiled = False  # set True only if your PT version compiles SN cleanly
+    #Encoder antialiasing parameters
     model.encoder_downsample_mode = "avg"
     model.encoder_blur_filt_size  = 5
-
-    # VAE block — off (compatibility only)
+    # VAE block — off by default (kept for compatibility)
     model.vae = ml_collections.ConfigDict()
     model.vae.enabled = False
 
@@ -96,13 +92,13 @@ def get_config():
     loss.reconstruction   = "mse"
     loss.beta_kl          = 1e-3
 
-    # Local isometry regs (unchanged)
-    loss.enc_iso_weight   = 0.0 #5e-3 
-    loss.dec_iso_weight   = 0.0 #5e-3 
+    # local isometry regs
+    loss.enc_iso_weight   = 5e-3 #0.04
+    loss.dec_iso_weight   = 5e-3 #0.04
     loss.num_v            = 1
 
-    # --- MECAE (extrinsic curvature) ---
-    loss.curvature_weight = 0.0 #7.5e-5
+    # --- MECAE (extrinsic) ---
+    loss.curvature_weight = 1e-4
     loss.curvature = curv = ml_collections.ConfigDict()
     curv.mode              = "mecae"
     curv.target            = "both"        # "encoder" | "decoder" | "both"
@@ -116,17 +112,17 @@ def get_config():
     curv.B_curv            = 128
     curv.every_n_steps     = 3
 
-    # --- Metric Smoothness (off by default, parity) ---
-    loss.metric_smooth_weight = 0.0
+    # --- Metric Smoothness (decoder pullback metric invariants) ---
+    loss.metric_smooth_weight = 0.0   # start small; 1e-4–3e-3 typical
     loss.metric_smoothness = ms = ml_collections.ConfigDict()
-    ms.K_w               = 1
+    ms.K_w               = 1           # 1–2; raise to 2 if logs look noisy
     ms.use_rademacher    = True
-    ms.use_exact_hessian = True
+    ms.use_exact_hessian = True        # nested JVPs; set False to use FD fallback
     ms.fd_eps            = 1e-3
-    ms.normalize_by_dim  = True
-    ms.target            = "encoder"
-    ms.B_curv            = curv.B_curv
-    ms.every_n_steps     = curv.every_n_steps
+    ms.normalize_by_dim  = True        # scale-free across latent dims
+    ms.target            = "encoder"   # "encoder" | "decoder" | "both"
+    ms.B_curv            = curv.B_curv # reuse same sub-batch size
+    ms.every_n_steps     = curv.every_n_steps  # same cadence as MECAE
 
     # --- MICAE (intrinsic via Gauss) ---
     loss.intrinsic_weight  = 0.0
@@ -141,12 +137,11 @@ def get_config():
     intr.every_n_steps     = curv.every_n_steps
 
     # ---------------- geometry (observation & latent) ----------------
-    cfg.loss.geom = geom = ml_collections.ConfigDict()
+    loss.geom = geom = ml_collections.ConfigDict()
 
-    # Observation-space geometry (keep disabled)
     geom.data = data_geom = ml_collections.ConfigDict()
     data_geom.enabled                = False
-    data_geom.diffusion_config       = "configs/rendered_so_dataset/s2_axisangle_64x64_gray_unet.py"
+    data_geom.diffusion_config       = "configs/rotated_mnist/config.py"
     data_geom.metric_type            = "jacobian"
     data_geom.lam_metric             = 1e-3
     data_geom.t_value                = 0.03
@@ -157,13 +152,12 @@ def get_config():
     data_geom.cg.preconditioner      = None
     data_geom.cg.precond_diag_samples= 8
 
-    # Latent-space geometry (enabled; point it to your ambient diffusion config)
     geom.latent = lat = ml_collections.ConfigDict()
     lat.enabled          = True
     lat.metric_type      = "jacobian"
     lat.lam_metric       = 1e-3
     lat.t_value          = 0.05
-    lat.diffusion_config = "configs/teapots_64/sphere/autoencoder/latent_config.py"
+    lat.diffusion_config = "configs/analytic_manifold/sphere/improved_architecture/latent_config.py"
     lat.cg = ml_collections.ConfigDict()
     lat.cg.max_iter              = 5
     lat.cg.tol                   = 1e-6
@@ -172,7 +166,6 @@ def get_config():
 
     # ---------------- optim ----------------
     cfg.optim = opt = ml_collections.ConfigDict()
-    # steps_per_epoch: 90% train split heuristic as before
     steps_per_epoch   = ceil(data.data_samples * 0.9 / data.batch_size)
     opt.total_steps   = steps_per_epoch * tr.epochs
     opt.optimizer     = "AdamW"
@@ -185,3 +178,4 @@ def get_config():
     opt.grad_clip     = 1.0
 
     return cfg
+ 

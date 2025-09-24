@@ -58,7 +58,7 @@ def get_config():
     model.groups_gn        = 8
     model.ema_decay        = 0.999
     model.compile          = True
-    model.checkpoint       = None  # 'AE_last_EMA.pth'
+    model.checkpoint       = 'AE_last_EMA.pth'
 
     # CoordConv toggles
     model.use_coordconv_encoder             = False
