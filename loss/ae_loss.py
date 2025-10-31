@@ -1,4 +1,3 @@
-# loss/ae_loss.py
 from __future__ import annotations
 from typing import Dict, Tuple, Optional
 from contextlib import contextmanager, nullcontext
@@ -19,9 +18,8 @@ from .isometry import (
 from .curvature import (
     mecae_extrinsic_decoder,
     micae_intrinsic_decoder,
-    metric_smoothness_decoder_Ginv_fast,  # <-- direct import
+    metric_smoothness_decoder_Ginv_fast,
 )
-
 
 @contextmanager
 def freeze_params(module: Optional[nn.Module]):
@@ -69,12 +67,14 @@ def ae_loss(
     cfg,
     device: torch.device,
     train: bool = True,
+    weight_override: Optional[Dict[str, float]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, Optional[float]]]:
     """
     Autoencoder loss with optional isometry + MECAE (extrinsic) + MICAE (intrinsic) +
     Metric Smoothness (invariant, G^{-1}-normalised).
     """
     x = batch[0].to(device)
+    wo = weight_override or {}
 
     # ---- reconstruction ----
     use_vae = bool(getattr(getattr(cfg, "model", None), "vae", {}).get("enabled", False))
@@ -93,8 +93,8 @@ def ae_loss(
     beta_kl = float(getattr(cfg.loss, "beta_kl", 1.0))
 
     # ---- isometry ----
-    enc_iso_w = float(getattr(cfg.loss, "enc_iso_weight", 0.0))
-    dec_iso_w = float(getattr(cfg.loss, "dec_iso_weight", 0.0))
+    enc_iso_w = float(wo.get("enc_iso_weight", getattr(cfg.loss, "enc_iso_weight", 0.0)))
+    dec_iso_w = float(wo.get("dec_iso_weight", getattr(cfg.loss, "dec_iso_weight", 0.0)))
     num_v     = int(getattr(cfg.loss, "num_v", 2))
 
     enc_iso = torch.tensor(0.0, device=device)
@@ -114,15 +114,14 @@ def ae_loss(
     # ---- curvature regs (MECAE / MICAE) ----
     me_iter_val: Optional[float] = None
     mi_iter_val: Optional[float] = None
-    ms_iter_val: Optional[float] = None  # metric smoothness
+    ms_iter_val: Optional[float] = None
 
     metrics: Dict[str, Optional[float]] = {}
 
-    curv_w = float(getattr(cfg.loss, "curvature_weight", 0.0))
-    intr_w = float(getattr(cfg.loss, "intrinsic_weight", 0.0))
-    ms_w   = float(getattr(cfg.loss, "metric_smooth_weight", 0.0))
+    curv_w = float(wo.get("curvature_weight", getattr(cfg.loss, "curvature_weight", 0.0)))
+    intr_w = float(wo.get("intrinsic_weight", getattr(cfg.loss, "intrinsic_weight", 0.0)))
+    ms_w   = float(wo.get("metric_smooth_weight", getattr(cfg.loss, "metric_smooth_weight", 0.0)))
 
-    # per-step schedule gate
     step_attr = "_curv_step"
     step = getattr(model, step_attr, 0)
 
@@ -132,19 +131,16 @@ def ae_loss(
 
     every_n     = int(getattr(curv_cfg, "every_n_steps", 1))
     do_curv     = train and (curv_w > 0.0) and (every_n <= 1 or (step % max(every_n, 1) == 0))
-
     intr_every  = int(getattr(intr_cfg, "every_n_steps", every_n))
     do_intr     = train and (intr_w > 0.0) and (intr_every <= 1 or (step % max(intr_every, 1) == 0))
-
     ms_every    = int(getattr(ms_cfg, "every_n_steps", every_n))
     do_ms       = train and (ms_w > 0.0) and (ms_every <= 1 or (step % max(ms_every, 1) == 0))
 
-    # shared target & freeze policy
-    target   = str(getattr(curv_cfg, "target", "encoder")).lower()
+    target     = str(getattr(curv_cfg, "target", "encoder")).lower()
     z_full32 = model.encode(x).to(torch.float32)
 
     if target == "encoder":
-        dec_mod  = _guess_decoder_module(model)
+        dec_mod    = _guess_decoder_module(model)
         freeze_ctx = freeze_params(dec_mod)
         z_in = z_full32
     elif target == "both":
@@ -154,7 +150,6 @@ def ae_loss(
         freeze_ctx = nullcontext()
         z_in = z_full32.detach()
 
-    # sub-batch for heavy geometry terms
     B = z_in.size(0)
     B_curv = int(getattr(curv_cfg, "B_curv", 8))
     B_curv = max(1, min(B_curv, B))
@@ -162,7 +157,6 @@ def ae_loss(
         else torch.arange(B, device=z_in.device)
     z_curv = z_in[idx]
 
-    # run geometry terms (no autocast)
     if (do_curv or do_intr or do_ms):
         if dynamo is not None:
             try:
@@ -172,8 +166,6 @@ def ae_loss(
 
         with torch.amp.autocast("cuda", enabled=False), freeze_ctx:
             JGL = None
-
-            # ---- MECAE (extrinsic) ----
             if do_curv:
                 me_out = mecae_extrinsic_decoder(
                     decode=model.decode, z=z_curv,
@@ -191,7 +183,6 @@ def ae_loss(
                 me_iter_val = float(eec.detach().item())
                 JGL = (me_out["J"], me_out["G"], me_out["L"])
 
-            # ---- MICAE (intrinsic via Gauss) ----
             if do_intr:
                 mi_out = micae_intrinsic_decoder(
                     decode=model.decode, z=z_curv,
@@ -207,22 +198,18 @@ def ae_loss(
                 eic = mi_out["EIC"].mean().to(x.dtype)
                 total += intr_w * eic
                 mi_iter_val = float(eic.detach().item())
-                # expose MICAE debug scalars
                 for k, v in mi_out.items():
-                    if k == "EIC":
-                        continue
+                    if k == "EIC": continue
                     if isinstance(v, torch.Tensor) and v.ndim == 0 and torch.isfinite(v):
                         metrics[f"reg/micae/{k}"] = float(v.detach().item())
                 metrics["reg/micae/EIC_mean"] = mi_iter_val
 
-            # ---- Metric Smoothness (invariant, G^{-1}-normalised) ----
             if do_ms:
-                # optional: allow a separate target for MS; default = curvature target
                 target_ms = str(getattr(ms_cfg, "target", target)).lower()
                 if target_ms == "encoder":
                     dec_mod_ms = _guess_decoder_module(model)
                     freeze_ctx_ms = freeze_params(dec_mod_ms)
-                    z_for_ms = z_full32[idx]  # same sub-batch as curvature
+                    z_for_ms = z_full32[idx]
                 elif target_ms == "both":
                     freeze_ctx_ms = nullcontext()
                     z_for_ms = z_full32[idx]
@@ -233,12 +220,12 @@ def ae_loss(
                 with freeze_ctx_ms:
                     ms_out = metric_smoothness_decoder_Ginv_fast(
                         decode=model.decode,
-                        z=z_for_ms,  # (B_curv, m)
+                        z=z_for_ms,
                         K_w=int(getattr(ms_cfg, "K_w", 1)),
                         use_rademacher=bool(getattr(ms_cfg, "use_rademacher", True)),
                         use_exact_hessian=bool(getattr(ms_cfg, "use_exact_hessian", True)),
                         fd_eps=float(getattr(ms_cfg, "fd_eps", 1e-3)),
-                        JGL=JGL,  # reuse J,G,L from MECAE if available
+                        JGL=JGL,
                         normalize_by_dim=bool(getattr(ms_cfg, "normalize_by_dim", True)),
                     )
                     msm = ms_out["MSM_G"].mean().to(x.dtype)
@@ -248,7 +235,6 @@ def ae_loss(
     if train:
         setattr(model, step_attr, int(step) + 1)
 
-    # stem alpha (if present)
     stem_alpha = None
     try:
         stem_alpha = float(getattr(getattr(model, "decoder", None), "stem", None).alpha.item())
@@ -256,15 +242,21 @@ def ae_loss(
         pass
 
     metrics.update({
-        "loss/total":          float(total.detach().item()),
+        "loss/total": float(total.detach().item()),
         "loss/reconstruction": float(rec.detach().item()),
-        "loss/kl":             float(kl.detach().item()),
-        "reg/enc_iso":         float(enc_iso.detach().item()),
-        "reg/dec_iso":         float(dec_iso.detach().item()),
-        "reg/mecae_eec":       me_iter_val,
-        "reg/micae_eic":       mi_iter_val,
+        "loss/kl": float(kl.detach().item()),
+        "reg/enc_iso": float(enc_iso.detach().item()),
+        "reg/dec_iso": float(dec_iso.detach().item()),
+        "reg/mecae_eec": me_iter_val,
+        "reg/micae_eic": mi_iter_val,
         "reg/metric_smoothness": ms_iter_val,
-        "model/stem_alpha":    stem_alpha,
+        "model/stem_alpha": stem_alpha,
+        "weights/enc_iso": enc_iso_w,
+        "weights/dec_iso": dec_iso_w,
+        "weights/curv": curv_w,
+        "weights/intr": intr_w,
+        "weights/ms": ms_w,
     })
 
     return total, metrics
+

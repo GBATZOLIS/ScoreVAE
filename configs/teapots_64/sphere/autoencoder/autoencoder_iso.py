@@ -140,6 +140,32 @@ def get_config():
     intr.B_curv            = curv.B_curv
     intr.every_n_steps     = curv.every_n_steps
 
+    # ─────────────────────────── Loss Ramps (UPDATED) ─────────────────────────── #
+    ramps = cfg.ramps = ml_collections.ConfigDict()
+    ramps.enabled = True
+    ramps.default_kind = "smoothstep" # Master switch for ramp type
+
+    # Isometry ramps
+    ramps.isometry = ml_collections.ConfigDict()
+    ramps.isometry.end_epoch = 5
+    ramps.isometry.start_epoch = 0
+
+    # Extrinsic Curvature (MECAE) ramps
+    ramps.mecae_extrinsic = ml_collections.ConfigDict()
+    ramps.mecae_extrinsic.end_epoch = 10
+    ramps.mecae_extrinsic.start_epoch = 0
+
+    # Intrinsic Curvature (MICAE) ramps
+    ramps.intrinsic = ml_collections.ConfigDict()
+    ramps.intrinsic.end_epoch = 12
+    ramps.intrinsic.start_epoch = 2
+
+    # Metric smoothness ramps
+    ramps.metric_smoothness = ml_collections.ConfigDict()
+    ramps.metric_smoothness.end_epoch = 8
+    ramps.metric_smoothness.start_epoch = 0
+
+
     # ---------------- geometry ----------------
     cfg.loss.geom = geom = ml_collections.ConfigDict()
 

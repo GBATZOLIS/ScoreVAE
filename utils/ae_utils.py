@@ -1104,3 +1104,233 @@ def perturb_latents_at_time(z: torch.Tensor, sde, t_val: float) -> torch.Tensor:
     # Broadcast std across non-batch dims if needed
     std_view = std.view(-1, *([1] * (z.dim() - 1))) if std.ndim == 1 else std
     return mean + std_view * xi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Compact Isometry Evaluation (2 plots total in TensorBoard)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def _take_anchor(val_loader, device, total: int, *, cache: Dict[str, torch.Tensor], key: str = "iso_anchor") -> torch.Tensor:
+    """
+    Deterministically take ~`total` samples from the start of val_loader and cache them.
+    Keeps the anchor set fixed across epochs so curves are comparable.
+    """
+    if key in cache:
+        return cache[key]
+    xs = []
+    for batch in val_loader:
+        x = batch[0].to(device, non_blocking=True)
+        xs.append(x)
+        if sum(t.size(0) for t in xs) >= total:
+            break
+    X = torch.cat(xs, dim=0)[:total].contiguous()
+    cache[key] = X
+    return X
+
+
+@torch.no_grad()
+def _decoder_eigs_and_G(model: nn.Module, x: torch.Tensor, lam: float = 0.0):
+    """
+    Return eigenvalues (B,d) and G (B,d,d) for decoder pullback metric G = J_d^T J_d.
+    Uses the same batched Jacobian builder as curvature code.
+    """
+    from loss.curvature import _build_J_and_G_batched
+    z = model.encode(x).to(torch.float32)
+    _, G, _ = _build_J_and_G_batched(model.decode, z, lam=float(lam))
+    Gs = 0.5 * (G + G.transpose(-1, -2))
+    evals = torch.linalg.eigvalsh(Gs.to(torch.float64)).to(torch.float32)  # (B,d)
+    return evals, Gs
+
+
+@torch.no_grad()
+def _encoder_eigs_and_G(model: nn.Module, x: torch.Tensor):
+    """
+    Return eigenvalues (B,d) and G_e (B,d,d) for encoder metric G_e = J_e J_e^T.
+    Uses per-sample jacrev (latent dim is small), still chunked by B_curv in caller.
+    """
+    from torch.func import jacrev
+    B, C, H, W = x.shape
+    evals_list, Gs_list = [], []
+
+    def f_single(x_flat: torch.Tensor) -> torch.Tensor:
+        x_img = x_flat.view(1, C, H, W)
+        return model.encode(x_img).squeeze(0)  # (d,)
+
+    for i in range(B):
+        xi = x[i].reshape(-1).to(torch.float32)
+        J_e = jacrev(f_single)(xi)                 # (d, D)
+        G   = J_e @ J_e.transpose(0, 1)            # (d, d)
+        Gs  = 0.5 * (G + G.transpose(0, 1))
+        ev  = torch.linalg.eigvalsh(Gs.to(torch.float64)).to(torch.float32)
+        evals_list.append(ev.unsqueeze(0)); Gs_list.append(Gs.unsqueeze(0))
+    return torch.cat(evals_list, 0), torch.cat(Gs_list, 0)
+
+
+@torch.no_grad()
+def _isometry_distances(evals: torch.Tensor, G: torch.Tensor, eps: float = 1e-12):
+    """
+    evals: (B,d), G: (B,d,d). Return per-sample scalars:
+      dR = ||logm(G)||_F = sqrt(sum (log λ_i)^2)
+      dF = ||G - I||_F / sqrt(d)
+    """
+    dR = torch.sqrt(torch.sum(torch.log(evals.clamp_min(eps))**2, dim=-1))  # (B,)
+    B, d = G.shape[0], G.shape[-1]
+    I = torch.eye(d, device=G.device, dtype=G.dtype).expand(B, d, d)
+    dF = torch.linalg.norm(G - I, ord='fro', dim=(1, 2)) / (d ** 0.5)       # (B,)
+    return dR, dF
+
+
+@torch.no_grad()
+def _cond_from_evals(evals: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Per-sample condition number κ = λ_max / λ_min."""
+    lam_min = evals.min(dim=-1).values.clamp_min(eps)
+    lam_max = evals.max(dim=-1).values
+    return lam_max / lam_min
+
+
+@torch.no_grad()
+def log_isometry_distance_batched(
+    val_loader,
+    writer,
+    model: nn.Module,
+    device: torch.device,
+    epoch: int,
+    cfg,
+    *,
+    modes: Tuple[str, ...] = ("decoder", "encoder"),
+    total_points: int = 200,
+    lam_decoder: float = 0.0,
+    tag_prefix: str = "AE",
+    _cache: Dict[str, torch.Tensor] = {},
+):
+    """
+    Compute isometry deviation on exactly `total_points`, processed in chunks of size
+    cfg.loss.curvature.B_curv (same memory as MECAE). Logs only three means per side:
+      dR_mean, dF_mean, log10(cond)_mean → fits into TWO multiline plots total.
+    """
+    # preserve training flag; evaluate for consistency
+    was_training = model.training
+    model.eval()
+
+    # geometry mini-batch size
+    try:
+        B_curv = int(getattr(getattr(cfg.loss, "curvature"), "B_curv", 8))
+    except Exception:
+        B_curv = 8
+    B_curv = max(1, B_curv)
+
+    # fixed anchor set across epochs
+    X = _take_anchor(val_loader, device, total=total_points, cache=_cache, key="iso_anchor")
+
+    def _summ(label: str, dR_all: torch.Tensor, dF_all: torch.Tensor, evals_all: torch.Tensor):
+        # condition number (per sample), then log10 for better scale
+        cond = _cond_from_evals(evals_all)
+        logcond = torch.log10(cond.clamp_min(1.0))  # κ≥1
+
+        # means only → two compact plots (decoder and encoder)
+        writer.add_scalar(f"{tag_prefix}/reg/{label}_dR_mean",       float(dR_all.mean().item()),   epoch)
+        writer.add_scalar(f"{tag_prefix}/reg/{label}_dF_mean",       float(dF_all.mean().item()),   epoch)
+        writer.add_scalar(f"{tag_prefix}/reg/{label}_logcond_mean",  float(logcond.mean().item()),  epoch)
+
+        # Optional deep-dive histogram (kept commented to avoid extra tiles)
+        # writer.add_histogram(f"{tag_prefix}/reg/{label}_log_eigs",
+        #                      torch.log(evals_all.clamp_min(1e-12)), epoch)
+
+    if "decoder" in modes:
+        dR_list, dF_list, ev_list = [], [], []
+        for i in range(0, X.size(0), B_curv):
+            x_chunk = X[i:i + B_curv]
+            ev, G = _decoder_eigs_and_G(model, x_chunk, lam=lam_decoder)
+            dR, dF = _isometry_distances(ev, G)
+            dR_list.append(dR); dF_list.append(dF); ev_list.append(ev)
+        _summ("dec", torch.cat(dR_list, 0), torch.cat(dF_list, 0), torch.cat(ev_list, 0))
+
+    if "encoder" in modes:
+        dR_list, dF_list, ev_list = [], [], []
+        for i in range(0, X.size(0), B_curv):
+            x_chunk = X[i:i + B_curv]
+            ev, G = _encoder_eigs_and_G(model, x_chunk)
+            dR, dF = _isometry_distances(ev, G)
+            dR_list.append(dR); dF_list.append(dF); ev_list.append(ev)
+        _summ("enc", torch.cat(dR_list, 0), torch.cat(dF_list, 0), torch.cat(ev_list, 0))
+
+    # restore training flag
+    model.train(was_training)
+
+
+def add_isometry_compact_layout(writer, ddp_rank_fn=lambda: 0, tag_prefix: str = "AE"):
+    """
+    Register a 2-plot compact layout once (call after creating SummaryWriter on rank 0).
+    """
+    if ddp_rank_fn() != 0:
+        return
+    layout = {
+        "Isometry (compact)": {
+            "Decoder dR / dF / log10(cond)": [
+                "Multiline",
+                [f"{tag_prefix}/reg/dec_dR_mean",
+                 f"{tag_prefix}/reg/dec_dF_mean",
+                 f"{tag_prefix}/reg/dec_logcond_mean"]
+            ],
+            "Encoder dR / dF / log10(cond)": [
+                "Multiline",
+                [f"{tag_prefix}/reg/enc_dR_mean",
+                 f"{tag_prefix}/reg/enc_dF_mean",
+                 f"{tag_prefix}/reg/enc_logcond_mean"]
+            ],
+        }
+    }
+    writer.add_custom_scalars(layout)
+
+# --- RAMP HELPER FUNCTIONS ---
+
+def _clip01(x: float) -> float:
+    """Clips a value to the [0, 1] range."""
+    return max(0.0, min(1.0, x))
+
+def ramp_value(progress: float, kind: str = "cosine") -> float:
+    """
+    Calculates a scalar in [0, 1] for a given progress in [0, 1].
+
+    Args:
+        progress (float): The input progress, typically from 0 to 1.
+        kind (str): The shape of the ramp. One of 'cosine', 'smoothstep', 'linear'.
+
+    Returns:
+        float: The ramped value in [0, 1].
+    """
+    p = _clip01(progress)
+    if kind == "linear":
+        return p
+    if kind == "smoothstep":
+        return p * p * (3.0 - 2.0 * p)
+    # Default to cosine
+    return 0.5 * (1.0 - math.cos(math.pi * p))
+
+def make_weight_ramp(
+    base_weight: float,
+    cur_epoch: int,
+    cur_iter_in_epoch: int,
+    steps_per_epoch: int,
+    ramp_cfg,
+    kind: str = "cosine"
+) -> float:
+    """
+    Smoothly ramps a weight from 0 to a base_weight based on a schedule.
+    """
+    if base_weight <= 0.0:
+        return 0.0
+
+    start_epoch = int(getattr(ramp_cfg, "start_epoch", 0))
+    end_epoch = int(getattr(ramp_cfg, "end_epoch", 1))
+
+    if cur_epoch < start_epoch:
+        return 0.0
+
+    total_ramp_steps = max(1, int((end_epoch - start_epoch) * steps_per_epoch))
+    current_step_in_ramp = max(0, int((cur_epoch - start_epoch) * steps_per_epoch + cur_iter_in_epoch))
+
+    progress = current_step_in_ramp / total_ramp_steps
+    val01 = ramp_value(progress, kind=kind)
+
+    return base_weight * val01

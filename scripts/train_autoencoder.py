@@ -26,7 +26,9 @@ from utils.train_utils import (
 )
 from utils.ae_utils import (
     get_reconstruction_callback, get_latent_scatter_callback,
-    get_update_latent_normalizer_callback, get_generation_callback
+    get_update_latent_normalizer_callback, get_generation_callback,
+    log_isometry_distance_batched, add_isometry_compact_layout, 
+    make_weight_ramp
 )
 from utils.optim_utils import get_optimizer_and_scheduler
 from data.data_utils_ddp import get_dataloaders
@@ -185,7 +187,19 @@ class _NullWriter:
     def add_figure(self, *a, **k): pass
     def close(self): pass
 
-
+def get_cfg_attr(config, path, default=None):
+    """
+    Safely access nested attributes in a config dictionary.
+    """
+    keys = path.split('.')
+    val = config
+    for key in keys:
+        if hasattr(val, key):
+            val = getattr(val, key)
+        else:
+            return default
+    return val
+    
 # ---------------- Post-training for latent diffusion ----------------
 
 def post_train_latent(
@@ -447,12 +461,15 @@ def post_train_latent(
 
 def train(cfg):
     # DDP setup
-    devices_cfg = getattr(cfg.training, "devices", None)  # e.g., "auto" or "0,1,2,3" or [0,1,2,3]
+    devices_cfg = getattr(cfg.training, "devices", None)
     device, rank, world_size, _ = setup_distributed(devices_cfg)
 
     # dirs + writer (rank0 only)
     tb_dir, ckpt_dir, _ = prepare_training_dirs(cfg)
     writer = SummaryWriter(log_dir=tb_dir) if rank == 0 else _NullWriter()
+
+    if rank == 0:
+        add_isometry_compact_layout(writer, ddp_rank_fn=ddp_rank)
 
     # data (DDP-aware loaders + samplers)
     train_loader, val_loader, test_loader, samplers = get_dataloaders(
@@ -471,7 +488,7 @@ def train(cfg):
             base_model,
             device_ids=[device.index] if device.type == "cuda" else None,
             output_device=device.index if device.type == "cuda" else None,
-            find_unused_parameters=True,  # decoder may be frozen on some steps
+            find_unused_parameters=True,
         )
         ema = EMA(model.module, decay=cfg.model.ema_decay)
     else:
@@ -494,14 +511,13 @@ def train(cfg):
         use_amp=True,
     )
 
-
     # AMP setup
     use_bf16 = torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and amp_dtype is torch.float16))
     autocast_ctx = torch.amp.autocast("cuda", dtype=amp_dtype) if device.type == "cuda" else nullcontext()
 
-    # -------- Latent diffusion (DDP-wrapped as well) --------
+    # Latent diffusion setup
     geom_block = getattr(cfg.loss, "geom", None)
     gen_cb = None
     latent_model = latent_opt = latent_sched = latent_sde = latent_dsm_loss = latent_ema = None
@@ -509,36 +525,23 @@ def train(cfg):
     latent_geom_cfg = getattr(geom_block, "latent", None) if geom_block else None
     if latent_geom_cfg and bool(getattr(latent_geom_cfg, "enabled", False)):
         lat_cfg = load_config(latent_geom_cfg.diffusion_config)
-        # ensure device/shape info
         lat_cfg.training.device = f"cuda:{device.index}" if device.type == "cuda" else "cpu"
         lat_cfg.data.latent_dim = cfg.model.latent_dim
         lat_cfg.data.shape = [cfg.model.latent_dim]
         lat_cfg.model.state_size = cfg.model.latent_dim
-
         steps_per_epoch_lat = len(train_loader) * int(lat_cfg.training.steps_per_ae)
         lat_cfg.optim.total_steps = steps_per_epoch_lat * cfg.training.epochs
-
         latent_sde = configure_sde(lat_cfg)
         latent_base = get_model(lat_cfg.model).to(device)
         latent_base.train()
-
         if ddp_is_active():
-            latent_model = nn.parallel.DistributedDataParallel(
-                latent_base,
-                device_ids=[device.index] if device.type == "cuda" else None,
-                output_device=device.index if device.type == "cuda" else None,
-                find_unused_parameters=False
-            )
+            latent_model = nn.parallel.DistributedDataParallel(latent_base, device_ids=[device.index] if device.type == "cuda" else None, output_device=device.index if device.type == "cuda" else None, find_unused_parameters=False)
             latent_ema = EMA(latent_model.module, decay=float(lat_cfg.model.ema_decay))
         else:
             latent_model = latent_base
             latent_ema = EMA(latent_model, decay=float(lat_cfg.model.ema_decay))
-
-        latent_opt, latent_sched = get_optimizer_and_scheduler(
-            latent_model.module if ddp_is_active() else latent_model, lat_cfg, global_step=0
-        )
+        latent_opt, latent_sched = get_optimizer_and_scheduler(latent_model.module if ddp_is_active() else latent_model, lat_cfg, global_step=0)
         latent_dsm_loss = _make_latent_dsm_loss(latent_sde)
-
         smp_steps = int(getattr(getattr(lat_cfg, "sampling", ml_collections.ConfigDict()), "steps", 250))
         smp_count = int(getattr(getattr(lat_cfg, "sampling", ml_collections.ConfigDict()), "num_samples", 36))
         smp_nrow  = getattr(getattr(lat_cfg, "sampling", ml_collections.ConfigDict()), "grid_nrow", None)
@@ -552,11 +555,12 @@ def train(cfg):
         ae_mod.train()
         it = tqdm(train_loader, desc=f"[AE] Epoch {epoch+1}/{cfg.training.epochs}") if ddp_rank() == 0 else train_loader
 
-        for data in it:
+        # vvv THIS IS THE ONLY LINE THAT CHANGED vvv
+        for i, data in enumerate(it):
             batch = prepare_batch(data, device)
             x = batch[0]
 
-            # ---- latent diffusion steps (k per AE step) ----
+            # ---- latent diffusion steps ----
             if latent_model:
                 lat_mod = latent_model.module if ddp_is_active() else latent_model
                 lat_mod.train()
@@ -577,41 +581,56 @@ def train(cfg):
                         writer.add_scalar("LatentDiff/Loss_iter", float(loss_lat.detach().item()), global_step)
 
             # ---- AE step ----
+            weight_override = {}
+            if get_cfg_attr(cfg, "ramps.enabled", False):
+                try:
+                    steps_per_epoch = len(train_loader)
+                except TypeError:
+                    steps_per_epoch = cfg.optim.total_steps // cfg.training.epochs
+                default_ramp_kind = get_cfg_attr(cfg, "ramps.default_kind", "cosine")
+                iso_ramp_cfg = get_cfg_attr(cfg, "ramps.isometry")
+                if iso_ramp_cfg:
+                    weight_override["enc_iso_weight"] = make_weight_ramp(cfg.loss.enc_iso_weight, epoch, i, steps_per_epoch, iso_ramp_cfg, kind=default_ramp_kind)
+                    weight_override["dec_iso_weight"] = make_weight_ramp(cfg.loss.dec_iso_weight, epoch, i, steps_per_epoch, iso_ramp_cfg, kind=default_ramp_kind)
+                mecae_ramp_cfg = get_cfg_attr(cfg, "ramps.mecae_extrinsic")
+                if mecae_ramp_cfg:
+                    weight_override["curvature_weight"] = make_weight_ramp(cfg.loss.curvature_weight, epoch, i, steps_per_epoch, mecae_ramp_cfg, kind=default_ramp_kind)
+                intr_ramp_cfg = get_cfg_attr(cfg, "ramps.intrinsic")
+                if intr_ramp_cfg:
+                    weight_override["intrinsic_weight"] = make_weight_ramp(cfg.loss.intrinsic_weight, epoch, i, steps_per_epoch, intr_ramp_cfg, kind=default_ramp_kind)
+                ms_ramp_cfg = get_cfg_attr(cfg, "ramps.metric_smoothness")
+                if ms_ramp_cfg:
+                    weight_override["metric_smooth_weight"] = make_weight_ramp(cfg.loss.metric_smooth_weight, epoch, i, steps_per_epoch, ms_ramp_cfg, kind=default_ramp_kind)
+            
             optimizer.zero_grad(set_to_none=True)
             ctx = freeze_eval(latent_model.module if (latent_model and ddp_is_active()) else latent_model) if latent_model else nullcontext()
             with autocast_ctx, ctx:
-                loss, metrics = ae_loss(ae_mod, batch, cfg, device, train=True)
+                loss, metrics = ae_loss(ae_mod, batch, cfg, device, train=True, weight_override=weight_override)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(ae_mod.parameters(), cfg.optim.grad_clip)
             scaler.step(optimizer)
             scaler.update()
-
             scheduler.step()
             ema.update()
 
             if ddp_rank() == 0:
                 writer.add_scalar("AE/Loss/train_iter", float(loss.detach().item()), global_step)
                 for k, v in metrics.items():
-                    if v is None: 
-                        continue
-                    try:
-                        v = float(v)
-                    except Exception:
-                        continue
-                    if not math.isfinite(v):
-                        continue
+                    if v is None: continue
+                    try: v = float(v)
+                    except Exception: continue
+                    if not math.isfinite(v): continue
                     writer.add_scalar(f"AE/{k}_iter", v, global_step)
                 if isinstance(it, tqdm):
                     it.set_postfix(loss=f"{loss.item():.4f}")
             global_step += 1
 
-        # ---- validation ----
+        # ---- validation, callbacks, and checkpointing ----
         ema.apply_shadow()
         if latent_model: latent_ema.apply_shadow()
         ae_mod.eval()
-
         val_loss_sum = torch.tensor(0.0, device=device)
         val_batches  = torch.tensor(0.0, device=device)
         with torch.no_grad(), autocast_ctx:
@@ -619,48 +638,24 @@ def train(cfg):
                 loss, _ = ae_loss(ae_mod, prepare_batch(data, device), cfg, device, train=False)
                 val_loss_sum += loss.detach()
                 val_batches  += torch.tensor(1.0, device=device)
-
         if ddp_is_active():
             dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
             dist.all_reduce(val_batches,  op=dist.ReduceOp.SUM)
-
         val_loss = (val_loss_sum / torch.clamp_min(val_batches, 1.0)).item()
         if ddp_rank() == 0:
             writer.add_scalar("AE/Loss/val", val_loss, epoch)
-
         if latent_model: latent_ema.restore()
         ema.restore()
-
-        # ---- end-of-epoch latent μ/σ update (DDP-aware callback) ----
-        # Get the update frequency from the config
         update_norm_freq = getattr(cfg.training, "update_norm_frequency", 1)
-
         if latent_model is not None and ((epoch + 1) % update_norm_freq == 0):
-            latent_norm_cb(
-                val_loader,
-                writer if ddp_rank() == 0 else _NullWriter(),  # fine to pass NullWriter
-                ae_mod,
-                device,
-                epoch
-            )
-
-        # ---- visualization (rank 0) ----
+            latent_norm_cb(val_loader, writer if ddp_rank() == 0 else _NullWriter(), ae_mod, device, epoch)
         if ddp_rank() == 0 and ((epoch + 1) % cfg.training.vis_frequency == 0):
             batch = next(iter(val_loader))
             recon_cb(batch, writer, ae_mod, device, epoch, tag_prefix="AE")
             latent_cb(val_loader, writer, ae_mod, device, epoch, tag_prefix="AE")
             if gen_cb is not None and latent_model is not None and latent_sde is not None:
-                gen_cb(
-                    writer=writer,
-                    model=ae_mod,
-                    latent_model=(latent_model.module if ddp_is_active() else latent_model),
-                    latent_sde=latent_sde,
-                    device=device,
-                    save_dir=tb_dir,
-                    epoch=epoch,
-                )
-
-        # ---- early stopping / ckpt (rank 0 decides) ----
+                gen_cb(writer=writer, model=ae_mod, latent_model=(latent_model.module if ddp_is_active() else latent_model), latent_sde=latent_sde, device=device, save_dir=tb_dir, epoch=epoch)
+            log_isometry_distance_batched(val_loader, writer, ae_mod, device, epoch, cfg, modes=("decoder", "encoder"), total_points=200, lam_decoder=0.0, tag_prefix="AE")
         stop_flag = torch.tensor(0, device=device, dtype=torch.int32)
         if ddp_rank() == 0:
             if val_loss < best_val_loss:
@@ -672,47 +667,32 @@ def train(cfg):
                 print(f"[AE] Early stopping at epoch {epoch+1}")
                 stop_flag.fill_(1)
             if (epoch + 1) % cfg.training.checkpoint_frequency == 0:
-                save_model(ae_mod, ema, epoch, val_loss, "AE", ckpt_dir, best_ckpts,
-                           global_step, best_val_loss, epochs_no_improve, optimizer, scheduler)
+                save_model(ae_mod, ema, epoch, val_loss, "AE", ckpt_dir, best_ckpts, global_step, best_val_loss, epochs_no_improve, optimizer, scheduler)
                 if latent_model:
                     lat_mod = latent_model.module if ddp_is_active() else latent_model
-                    save_model(lat_mod, latent_ema, epoch, val_loss, "LatentDiff", ckpt_dir,
-                               [], global_step, best_val_loss, epochs_no_improve, latent_opt, latent_sched)
+                    save_model(lat_mod, latent_ema, epoch, val_loss, "LatentDiff", ckpt_dir, [], global_step, best_val_loss, epochs_no_improve, latent_opt, latent_sched)
         if ddp_is_active():
             dist.broadcast(stop_flag, src=0)
         if int(stop_flag.item()) == 1:
             break
 
-    # ===================== POST LATENT-ONLY TRAINING =====================
-    # Continue training the latent diffusion model AFTER AE finishes
+    # ---- Post-training ----
     if latent_model is not None:
         _ = post_train_latent(
-            latent_model=latent_model,
-            latent_ema=latent_ema,
-            ae_mod=ae_mod,
-            ema=ema,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            train_sampler=train_sampler,
-            lat_cfg=lat_cfg,
-            latent_sde=latent_sde,
-            writer=writer,
-            device=device,
-            tb_dir=tb_dir,
-            ckpt_dir=ckpt_dir,
-            global_step=global_step,
-            best_val_loss=best_val_loss,
-            epochs_no_improve=epochs_no_improve,
-            gen_cb=gen_cb,
-            _make_latent_dsm_loss=_make_latent_dsm_loss,
+            latent_model=latent_model, latent_ema=latent_ema, ae_mod=ae_mod, ema=ema,
+            train_loader=train_loader, val_loader=val_loader, train_sampler=train_sampler,
+            lat_cfg=lat_cfg, latent_sde=latent_sde, writer=writer, device=device,
+            tb_dir=tb_dir, ckpt_dir=ckpt_dir, global_step=global_step,
+            best_val_loss=best_val_loss, epochs_no_improve=epochs_no_improve,
+            gen_cb=gen_cb, _make_latent_dsm_loss=_make_latent_dsm_loss,
             get_optimizer_and_scheduler=get_optimizer_and_scheduler,
-            prepare_batch=prepare_batch,
-            save_model=save_model,
+            prepare_batch=prepare_batch, save_model=save_model,
         )
 
     if ddp_rank() == 0 and writer is not None:
         writer.close()
     finalize_distributed(device=device)
+
 
 
 def main():

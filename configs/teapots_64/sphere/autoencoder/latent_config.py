@@ -1,4 +1,4 @@
-# configs/rotated_mnist/autoencoder/latent_config.py
+# configs/teapots_64/sphere/autoencoder/latent_config.py
 import ml_collections
 
 
@@ -31,7 +31,7 @@ def get_config():
     model.dropout    = 0.0
     model.compile    = False
     model.ema_decay  = 0.999
-    model.checkpoint = None #'LatentDiffPost_last_EMA.pth'
+    model.checkpoint = "LatentDiffPost_last_EMA.pth"
 
     # ---------------- Optimizer / Scheduler (total_steps is injected by the driver) ----------------
     cfg.optim = opt = ml_collections.ConfigDict()
