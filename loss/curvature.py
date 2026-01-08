@@ -608,3 +608,78 @@ def metric_smoothness_decoder_Ginv_fast(
         msm = msm / (m * m)
 
     return {"MSM_G": msm}
+
+def score_from_noise_pred(latent_model: nn.Module, zt: torch.Tensor, t: torch.Tensor, sde) -> torch.Tensor:
+    """
+    latent_model predicts eps-hat. Convert to score proxy:
+        s(z_t,t) ≈ - eps_hat(z_t,t) / std(t)
+    Shapes:
+        zt: [B,d]
+        t:  [B]
+        returns score: [B,d]
+    """
+    eps_hat = latent_model(zt, y=None, t=t)  # [B,d] (your latent model already supports this)
+    _, std = sde.marginal_prob(zt, t)        # std: [B] typically
+    B = zt.shape[0]
+    std_view = std.view(B, *([1] * (zt.ndim - 1))) if std.ndim == 1 else std
+    return -eps_hat / std_view
+
+
+def metric_smoothness_latent_score_Ginv_fd(
+    *,
+    z0: torch.Tensor,                  # [B,d] (should carry grad to encoder if you want encoder updates)
+    latent_model: nn.Module,           # frozen params; grads only wrt input
+    latent_sde,
+    t_value: float,
+    delta_std: float = 1e-2,
+    eps_metric: float = 1e-4,
+) -> Dict[str, torch.Tensor]:
+    """
+    Finite-difference proxy for || g^{-1} ∂g ||^2 using g_score = J_s^T J_s + eps I,
+    where s(z_t,t) is score proxy from noise predictor.
+
+    Returns dict with:
+      - "MSM_score": scalar tensor (mean over batch)
+    """
+    assert z0.ndim == 2, "expected z0 shape [B,d]"
+    B, d = z0.shape
+    device, dtype = z0.device, z0.dtype
+
+    t = torch.full((B,), float(t_value), device=device, dtype=dtype)
+
+    # sample zt = mean(z0,t) + std(t)*noise, BUT keep grad path z0 -> zt
+    noise = torch.randn_like(z0)
+    mean, std = latent_sde.marginal_prob(z0, t)
+    std_view = std.view(B, 1) if std.ndim == 1 else std
+    zt = mean + std_view * noise  # [B,d]
+
+    def score_single(z_single: torch.Tensor) -> torch.Tensor:
+        # z_single: [d] -> score: [d]
+        z = z_single.unsqueeze(0)              # [1,d]
+        tt = t[:1].to(z.dtype)                 # [1]
+        s = score_from_noise_pred(latent_model, z, tt, latent_sde).squeeze(0)
+        return s
+
+    # J(z): [B,d,d]
+    J1 = vmap(jacrev(score_single))(zt)
+    I = torch.eye(d, device=device, dtype=J1.dtype).expand(B, d, d)
+    g1 = J1.transpose(-1, -2) @ J1 + eps_metric * I  # [B,d,d]
+
+    # finite diff point
+    delta = delta_std * torch.randn_like(zt)
+    zt2 = zt + delta
+
+    J2 = vmap(jacrev(score_single))(zt2)
+    g2 = J2.transpose(-1, -2) @ J2 + eps_metric * I
+
+    dg = g2 - g1
+
+    # normalize by g^{-1/2} on both sides (d small, so Cholesky is cheap)
+    L = torch.linalg.cholesky(g1)            # [B,d,d]
+    Linv = torch.linalg.inv(L)               # [B,d,d]
+    A = Linv @ dg @ Linv.transpose(-1, -2)   # g^{-1/2} dg g^{-1/2}
+
+    denom = delta.pow(2).sum(dim=-1).clamp_min(1e-12)  # [B]
+    msm = (A.pow(2).sum(dim=(-1, -2)) / denom).mean()  # scalar
+
+    return {"MSM_score": msm}

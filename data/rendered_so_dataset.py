@@ -129,20 +129,67 @@ def _exp_axis_angle(n: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     s, c = torch.sin(a), torch.cos(a)
     return I + s*K + (1 - c) * (K @ K)
 
-def _build_lights_batch(R_view: torch.Tensor, dev: torch.device, dist=4.0, rim=True) -> PointLights:
-    dirs_cam = torch.tensor([[0.35, 0.35, 1.0], [-0.35, 0.20, 1.0], [0.0, 0.0, -1.0]], device=dev)
+def _build_lights_batch(
+    R_view: torch.Tensor,
+    dev: torch.device,
+    dist: float = 4.0,
+    rim: bool = True,
+    ambient: float = 0.18,
+    diffuse: float = 0.85,
+    specular: float = 0.35,
+) -> PointLights:
+    """
+    Build a batched multi-light rig aligned per-frame to the camera view.
+
+    Args:
+        R_view: (B, 3, 3) camera-to-world rotation for each frame.
+        dev:    torch.device.
+        dist:   distance of the lights from the origin (scene scale ~1).
+        rim:    if True, adds an extra back rim light along -Z_cam.
+        ambient/diffuse/specular: per-light color intensities.
+
+    Returns:
+        PointLights with location/ambient/diffuse/specular shaped (B, L, 3).
+    """
+    # Key, fill, back rim, and a soft "headlight" (facing camera) to avoid dark frames.
+    dirs_cam = torch.tensor(
+        [
+            [ 0.35,  0.35,  1.00],  # key
+            [-0.35,  0.20,  1.00],  # fill
+            [ 0.00,  0.00, -1.00],  # back (rim)
+            [ 0.00,  0.00,  1.00],  # headlight
+        ],
+        device=dev,
+        dtype=torch.float32,
+    )
     if rim:
-        dirs_cam = torch.cat([dirs_cam, torch.tensor([[0., 0., -1.]], device=dev)], 0)
-    dirs_w = (R_view @ dirs_cam.t()).transpose(1, 2)
-    dirs_w = dirs_w / dirs_w.norm(dim=-1, keepdim=True)
-    locs   = dirs_w * dist
-    L = locs.size(1)
-    amb  = locs.new_full((locs.size(0), L, 3), 0.10)
-    diff = locs.new_full((locs.size(0), L, 3), 0.65)
-    spec = locs.new_full((locs.size(0), L, 3), 0.25)
+        # Extra strong rim from behind to pop the silhouette
+        dirs_cam = torch.cat([dirs_cam, torch.tensor([[0.0, 0.0, -1.0]], device=dev)], dim=0)
+
+    # Rotate light directions from camera space into world space for each frame
+    # (R_view maps camera→world, so dirs_world = R_view @ dirs_cam^T).
+    dirs_w = (R_view @ dirs_cam.t()).transpose(1, 2)             # (B, L, 3)
+    dirs_w = dirs_w / (dirs_w.norm(dim=-1, keepdim=True) + 1e-9)  # normalize
+    locs   = dirs_w * dist                                        # place on a sphere of radius 'dist'
+
+    B, L, _ = locs.shape
+    amb  = locs.new_full((B, L, 3), ambient)
+    diff = locs.new_full((B, L, 3), diffuse)
+    spec = locs.new_full((B, L, 3), specular)
+
+    # Slightly dim the extra rim (last light) to keep it from blowing out edges
     if rim:
-        diff[:, -1], amb[:, -1], spec[:, -1] = torch.tensor([0.35, 0.35, 0.35], device=dev), 0., 0.
-    return PointLights(device=dev, location=locs, ambient_color=amb, diffuse_color=diff, specular_color=spec)
+        diff[:, -1] *= 0.5
+        spec[:, -1] *= 0.5
+
+    return PointLights(
+        device=dev,
+        location=locs,
+        ambient_color=amb,
+        diffuse_color=diff,
+        specular_color=spec,
+    )
+
 
 # ───────────────────── Worker renderer ───────────────────────── #
 def _worker_render(rank:int, device:str, chunk, mesh_path:str, aa, channels:int,
@@ -369,7 +416,7 @@ class RenderedSO3Dataset(Dataset):
     def _materialise_images(self):
         self.images = None
         if self.P.shape[0] == self.P.shape[1] and torch.allclose(self.P, torch.eye(self.P.shape[0])):
-            self.images = self.data.view(-1, self.channels, self.H, self.W).contiguous()
+            self.images = self.data.reshape(-1, self.channels, self.H, self.W).contiguous()
 
     # ---------- generation ----------
     def _generate_dataset(self, g):
@@ -440,7 +487,7 @@ class RenderedSO3Dataset(Dataset):
         else:
             self._gen_mp(tasks)
 
-        flat = self.data.view(self.data.size(0), -1)
+        flat = self.data.reshape(self.data.size(0), -1)
         d_img = flat.size(1); d_emb = self.ambient_dim or d_img
         if d_emb > d_img:
             A, _ = torch.linalg.qr(torch.randn(d_emb, d_img, generator=g))
@@ -451,7 +498,7 @@ class RenderedSO3Dataset(Dataset):
         with suppress(Exception):
             preview = (os.path.splitext(self.cache_path)[0] if self.cache_path else "rendered") + "_preview.png"
             pathlib.Path(preview).parent.mkdir(parents=True, exist_ok=True)
-            save_image(self.data.view(-1, self.channels, self.H, self.W)[:64], preview, nrow=8, normalize=True)
+            save_image(self.data.reshape(-1, self.channels, self.H, self.W)[:64], preview, nrow=8, normalize=True)
             print("[RenderedSO3] preview saved →", preview)
 
     def _gen_mp(self, tasks):
@@ -566,7 +613,7 @@ class RenderedSO3Dataset(Dataset):
     def __len__(self): return self.data.size(0)
     def __getitem__(self, idx):
         if self.images is not None: return self.images[idx], self.rotmats[idx]
-        return self.data[idx].view(self.channels, self.H, self.W), self.rotmats[idx]
+        return self.data[idx].reshape(self.channels, self.H, self.W), self.rotmats[idx]
 
     # ---------- Geodesic rendering in parameter space ----------
     @torch.no_grad()
@@ -827,7 +874,10 @@ def _debug_geodesics(ds: "RenderedSO3Dataset", pairs=5, frames=10, out_root="dat
     B, T = len(chosen), frames
     print(f"[profile] geodesic render B={B} T={T} → {dt*1000:.1f} ms  ({dt/(B*T)*1000:.2f} ms/frame) on {dev}")
 
-    save_image(sheet, os.path.join(out_root, "geodesics_grid.png"), nrow=frames, normalize=True)
+    save_image(
+    sheet, os.path.join(out_root, "geodesics_grid.png"),
+    nrow=frames, padding=0, normalize=True
+    )
     print("Saved contact sheet →", f"{out_root}/geodesics_grid.png")
 
 if __name__ == "__main__":
@@ -858,4 +908,4 @@ if __name__ == "__main__":
 
     ds = RenderedSO3Dataset(args)
     print(f"Dataset built: {len(ds)} samples → {args.dataset_path}")
-    _debug_geodesics(ds, pairs=8, frames=20)
+    _debug_geodesics(ds, pairs=8, frames=12)

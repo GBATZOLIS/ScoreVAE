@@ -445,6 +445,7 @@ def post_train_latent(
 
 # ---------------- main training ----------------
 
+# training driver: train() up to the early-stopping break (inclusive)
 def train(cfg):
     # DDP setup
     devices_cfg = getattr(cfg.training, "devices", None)  # e.g., "auto" or "0,1,2,3" or [0,1,2,3]
@@ -454,11 +455,36 @@ def train(cfg):
     tb_dir, ckpt_dir, _ = prepare_training_dirs(cfg)
     writer = SummaryWriter(log_dir=tb_dir) if rank == 0 else _NullWriter()
 
+    # Decide upfront whether we need an independent latent loader stream
+    geom_block = getattr(cfg.loss, "geom", None)
+    latent_geom_cfg = getattr(geom_block, "latent", None) if geom_block else None
+    latent_enabled = bool(latent_geom_cfg and bool(getattr(latent_geom_cfg, "enabled", False)))
+
     # data (DDP-aware loaders + samplers)
-    train_loader, val_loader, test_loader, samplers = get_dataloaders(
-        cfg.data, seed=cfg.random_seed, distributed=ddp_is_active(), rank=rank, world_size=world_size, return_samplers=True
-    )
+    if latent_enabled:
+        train_loader, train_loader_lat, val_loader, test_loader, samplers = get_dataloaders(
+            cfg.data,
+            seed=cfg.random_seed,
+            distributed=ddp_is_active(),
+            rank=rank,
+            world_size=world_size,
+            return_samplers=True,
+            return_latent_loader=True,
+        )
+    else:
+        train_loader, val_loader, test_loader, samplers = get_dataloaders(
+            cfg.data,
+            seed=cfg.random_seed,
+            distributed=ddp_is_active(),
+            rank=rank,
+            world_size=world_size,
+            return_samplers=True,
+            return_latent_loader=False,
+        )
+        train_loader_lat = None
+
     train_sampler: Optional[DistributedSampler] = samplers.get("train", None)
+    lat_sampler: Optional[DistributedSampler] = samplers.get("latent", None)
 
     # AE model (+DDP)
     base_model = get_model(cfg.model).to(device)
@@ -485,7 +511,7 @@ def train(cfg):
         resume_training(cfg, ae_mod, ema, load_model, get_optimizer_and_scheduler)
 
     # callbacks
-    recon_cb  = get_reconstruction_callback()
+    recon_cb = get_reconstruction_callback()
     latent_cb = get_latent_scatter_callback(num_batches=20, max_points=5000, mode="both")
     latent_norm_cb = get_update_latent_normalizer_callback(
         min_count=getattr(cfg.training, "latent_norm_min_count", 4000),
@@ -494,7 +520,6 @@ def train(cfg):
         use_amp=True,
     )
 
-
     # AMP setup
     use_bf16 = torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
@@ -502,19 +527,20 @@ def train(cfg):
     autocast_ctx = torch.amp.autocast("cuda", dtype=amp_dtype) if device.type == "cuda" else nullcontext()
 
     # -------- Latent diffusion (DDP-wrapped as well) --------
-    geom_block = getattr(cfg.loss, "geom", None)
     gen_cb = None
     latent_model = latent_opt = latent_sched = latent_sde = latent_dsm_loss = latent_ema = None
     lat_cfg = None
-    latent_geom_cfg = getattr(geom_block, "latent", None) if geom_block else None
-    if latent_geom_cfg and bool(getattr(latent_geom_cfg, "enabled", False)):
+
+    if latent_enabled:
         lat_cfg = load_config(latent_geom_cfg.diffusion_config)
+
         # ensure device/shape info
         lat_cfg.training.device = f"cuda:{device.index}" if device.type == "cuda" else "cpu"
         lat_cfg.data.latent_dim = cfg.model.latent_dim
         lat_cfg.data.shape = [cfg.model.latent_dim]
         lat_cfg.model.state_size = cfg.model.latent_dim
 
+        # important: total latent steps = (AE steps/epoch) * (steps_per_ae) * epochs
         steps_per_epoch_lat = len(train_loader) * int(lat_cfg.training.steps_per_ae)
         lat_cfg.optim.total_steps = steps_per_epoch_lat * cfg.training.epochs
 
@@ -527,7 +553,7 @@ def train(cfg):
                 latent_base,
                 device_ids=[device.index] if device.type == "cuda" else None,
                 output_device=device.index if device.type == "cuda" else None,
-                find_unused_parameters=False
+                find_unused_parameters=False,
             )
             latent_ema = EMA(latent_model.module, decay=float(lat_cfg.model.ema_decay))
         else:
@@ -535,19 +561,45 @@ def train(cfg):
             latent_ema = EMA(latent_model, decay=float(lat_cfg.model.ema_decay))
 
         latent_opt, latent_sched = get_optimizer_and_scheduler(
-            latent_model.module if ddp_is_active() else latent_model, lat_cfg, global_step=0
+            latent_model.module if ddp_is_active() else latent_model,
+            lat_cfg,
+            global_step=0,
         )
         latent_dsm_loss = _make_latent_dsm_loss(latent_sde)
 
         smp_steps = int(getattr(getattr(lat_cfg, "sampling", ml_collections.ConfigDict()), "steps", 250))
         smp_count = int(getattr(getattr(lat_cfg, "sampling", ml_collections.ConfigDict()), "num_samples", 36))
-        smp_nrow  = getattr(getattr(lat_cfg, "sampling", ml_collections.ConfigDict()), "grid_nrow", None)
+        smp_nrow = getattr(getattr(lat_cfg, "sampling", ml_collections.ConfigDict()), "grid_nrow", None)
         gen_cb = get_generation_callback(sample_steps=smp_steps, sample_count=smp_count, grid_nrow=smp_nrow)
+
+    # Separate latent step counter (so TB plots make sense when K>1)
+    latent_step = 0
 
     # ============ Training loop ============
     for epoch in range(start_epoch, cfg.training.epochs):
         if ddp_is_active() and isinstance(train_sampler, DistributedSampler):
             train_sampler.set_epoch(epoch)
+
+        # Prepare an independent latent iterator that can be advanced K times per AE step
+        if latent_model is not None:
+            assert train_loader_lat is not None, "return_latent_loader=True required when latent_model is enabled"
+            lat_iter = iter(train_loader_lat)
+            lat_stream_epoch = 100_000 * (epoch + 1)  # reshuffle seed base for wraparounds
+            if ddp_is_active() and isinstance(lat_sampler, DistributedSampler):
+                lat_sampler.set_epoch(lat_stream_epoch)
+
+            def next_lat_batch():
+                nonlocal lat_iter, lat_stream_epoch
+                try:
+                    return next(lat_iter)
+                except StopIteration:
+                    lat_stream_epoch += 1
+                    if ddp_is_active() and isinstance(lat_sampler, DistributedSampler):
+                        lat_sampler.set_epoch(lat_stream_epoch)
+                    lat_iter = iter(train_loader_lat)
+                    return next(lat_iter)
+        else:
+            next_lat_batch = None
 
         ae_mod.train()
         it = tqdm(train_loader, desc=f"[AE] Epoch {epoch+1}/{cfg.training.epochs}") if ddp_rank() == 0 else train_loader
@@ -557,30 +609,45 @@ def train(cfg):
             x = batch[0]
 
             # ---- latent diffusion steps (k per AE step) ----
-            if latent_model:
+            if latent_model is not None:
                 lat_mod = latent_model.module if ddp_is_active() else latent_model
                 lat_mod.train()
                 _set_requires_grad(lat_mod, True)
-                with torch.no_grad():
-                    z_cur = ae_mod.encode(x).detach()
-                    z_cur_hat = ae_mod.normalize_latent(z_cur)
+
                 k_steps = int(lat_cfg.training.steps_per_ae)
                 for _ in range(k_steps):
+                    data_lat = next_lat_batch()
+                    batch_lat = prepare_batch(data_lat, device)
+                    x_lat = batch_lat[0]
+
+                    with torch.no_grad():
+                        z0 = ae_mod.encode(x_lat).detach()
+                        z0_hat = ae_mod.normalize_latent(z0)
+
                     latent_opt.zero_grad(set_to_none=True)
-                    loss_lat = latent_dsm_loss(latent_model, z_cur_hat)
+                    loss_lat = latent_dsm_loss(latent_model, z0_hat)
                     loss_lat.backward()
                     nn.utils.clip_grad_norm_(lat_mod.parameters(), lat_cfg.optim.grad_clip)
                     latent_opt.step()
-                    if latent_sched: latent_sched.step()
+                    if latent_sched:
+                        latent_sched.step()
                     latent_ema.update()
+
                     if ddp_rank() == 0:
-                        writer.add_scalar("LatentDiff/Loss_iter", float(loss_lat.detach().item()), global_step)
+                        writer.add_scalar("LatentDiff/Loss_iter", float(loss_lat.detach().item()), latent_step)
+                    latent_step += 1
 
             # ---- AE step ----
             optimizer.zero_grad(set_to_none=True)
             ctx = freeze_eval(latent_model.module if (latent_model and ddp_is_active()) else latent_model) if latent_model else nullcontext()
             with autocast_ctx, ctx:
-                loss, metrics = ae_loss(ae_mod, batch, cfg, device, train=True)
+                loss, metrics = ae_loss(
+                    ae_mod, batch, cfg, device, train=True,
+                    latent_model=(latent_model.module if ddp_is_active() else latent_model) if latent_model else None,
+                    latent_ema=latent_ema if latent_model else None,
+                    latent_sde=latent_sde if latent_model else None,
+                )
+
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -594,7 +661,7 @@ def train(cfg):
             if ddp_rank() == 0:
                 writer.add_scalar("AE/Loss/train_iter", float(loss.detach().item()), global_step)
                 for k, v in metrics.items():
-                    if v is None: 
+                    if v is None:
                         continue
                     try:
                         v = float(v)
@@ -609,39 +676,40 @@ def train(cfg):
 
         # ---- validation ----
         ema.apply_shadow()
-        if latent_model: latent_ema.apply_shadow()
+        if latent_model:
+            latent_ema.apply_shadow()
         ae_mod.eval()
 
         val_loss_sum = torch.tensor(0.0, device=device)
-        val_batches  = torch.tensor(0.0, device=device)
+        val_batches = torch.tensor(0.0, device=device)
         with torch.no_grad(), autocast_ctx:
             for data in val_loader:
                 loss, _ = ae_loss(ae_mod, prepare_batch(data, device), cfg, device, train=False)
                 val_loss_sum += loss.detach()
-                val_batches  += torch.tensor(1.0, device=device)
+                val_batches += torch.tensor(1.0, device=device)
 
         if ddp_is_active():
             dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(val_batches,  op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_batches, op=dist.ReduceOp.SUM)
 
         val_loss = (val_loss_sum / torch.clamp_min(val_batches, 1.0)).item()
         if ddp_rank() == 0:
             writer.add_scalar("AE/Loss/val", val_loss, epoch)
 
-        if latent_model: latent_ema.restore()
+        if latent_model:
+            latent_ema.restore()
         ema.restore()
 
         # ---- end-of-epoch latent μ/σ update (DDP-aware callback) ----
-        # Get the update frequency from the config
         update_norm_freq = getattr(cfg.training, "update_norm_frequency", 1)
 
         if latent_model is not None and ((epoch + 1) % update_norm_freq == 0):
             latent_norm_cb(
                 val_loader,
-                writer if ddp_rank() == 0 else _NullWriter(),  # fine to pass NullWriter
+                writer if ddp_rank() == 0 else _NullWriter(),
                 ae_mod,
                 device,
-                epoch
+                epoch,
             )
 
         # ---- visualization (rank 0) ----
@@ -668,16 +736,23 @@ def train(cfg):
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
+
             if epochs_no_improve >= cfg.training.patience_epochs:
                 print(f"[AE] Early stopping at epoch {epoch+1}")
                 stop_flag.fill_(1)
+
             if (epoch + 1) % cfg.training.checkpoint_frequency == 0:
-                save_model(ae_mod, ema, epoch, val_loss, "AE", ckpt_dir, best_ckpts,
-                           global_step, best_val_loss, epochs_no_improve, optimizer, scheduler)
+                save_model(
+                    ae_mod, ema, epoch, val_loss, "AE", ckpt_dir, best_ckpts,
+                    global_step, best_val_loss, epochs_no_improve, optimizer, scheduler
+                )
                 if latent_model:
                     lat_mod = latent_model.module if ddp_is_active() else latent_model
-                    save_model(lat_mod, latent_ema, epoch, val_loss, "LatentDiff", ckpt_dir,
-                               [], global_step, best_val_loss, epochs_no_improve, latent_opt, latent_sched)
+                    save_model(
+                        lat_mod, latent_ema, epoch, val_loss, "LatentDiff", ckpt_dir,
+                        [], global_step, best_val_loss, epochs_no_improve, latent_opt, latent_sched
+                    )
+
         if ddp_is_active():
             dist.broadcast(stop_flag, src=0)
         if int(stop_flag.item()) == 1:

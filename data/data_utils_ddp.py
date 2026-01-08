@@ -1,20 +1,25 @@
+# data/data_utils_ddp.py
 """
 High-throughput DataLoader helper.
+
 DDP-ready via DistributedSampler, but BACKWARD-COMPATIBLE:
 - By default returns (train_loader, val_loader, test_loader) like before.
 - If return_samplers=True, returns (train_loader, val_loader, test_loader, samplers_dict).
+- If return_latent_loader=True, returns (train_loader, train_loader_lat, val_loader, test_loader, ...)
 Each loader also gets an attribute ._dist_sampler with its sampler (or None).
 """
 from __future__ import annotations
+
+from typing import Optional, Tuple, Dict, Union
+
 import torch
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
-from typing import Optional, Tuple, Dict, Union
 
 from .sphere import KSphereDataset
-from .earth  import EarthDataset
-from .so     import SOdataset
+from .earth import EarthDataset
+from .so import SOdataset
 
 # Legacy dataset (optional import – requires pytorch3d)
 try:
@@ -41,7 +46,7 @@ except Exception:
     RotatedMNIST = None
 
 
-def _split(dataset, train_frac=0.9, seed=42):
+def _split_2way(dataset, train_frac: float = 0.9, seed: int = 42):
     g = torch.Generator().manual_seed(seed)
     n = len(dataset)
     t = int(train_frac * n)
@@ -49,14 +54,29 @@ def _split(dataset, train_frac=0.9, seed=42):
     return random_split(dataset, [t, v], generator=g)
 
 
-def _make_loader(dataset,
-                 *,
-                 shuffle: bool,
-                 drop_last: bool,
-                 batch_size: int,
-                 n_workers: int,
-                 pin_mem: bool,
-                 sampler=None):
+def _split_3way(dataset, train_frac: float = 0.9, val_frac: float = 0.05, seed: int = 42):
+    """Train/val/test with (train_frac, val_frac, 1-train_frac-val_frac)."""
+    assert 0.0 < train_frac < 1.0
+    assert 0.0 <= val_frac < 1.0
+    assert train_frac + val_frac < 1.0
+    g = torch.Generator().manual_seed(seed)
+    n = len(dataset)
+    train_len = int(train_frac * n)
+    val_len = int(val_frac * n)
+    test_len = n - train_len - val_len
+    return random_split(dataset, [train_len, val_len, test_len], generator=g)
+
+
+def _make_loader(
+    dataset,
+    *,
+    shuffle: bool,
+    drop_last: bool,
+    batch_size: int,
+    n_workers: int,
+    pin_mem: bool,
+    sampler=None,
+):
     """Build a DataLoader, only setting worker-related kwargs when n_workers>0."""
     kwargs = dict(
         batch_size=batch_size,
@@ -76,29 +96,147 @@ def _make_loader(dataset,
         kwargs["multiprocessing_context"] = "spawn"
 
     loader = DataLoader(dataset, **kwargs)
-    # Attach for convenience
     setattr(loader, "_dist_sampler", sampler)
     return loader
 
 
-def _maybe_sampler(dataset,
-                   *,
-                   shuffle: bool,
-                   drop_last: bool,
-                   batch_size: int,
-                   n_workers: int,
-                   distributed: bool,
-                   rank: int,
-                   world_size: int,
-                   pin_mem: bool):
+def _maybe_sampler(
+    dataset,
+    *,
+    shuffle: bool,
+    drop_last: bool,
+    batch_size: int,
+    n_workers: int,
+    distributed: bool,
+    rank: int,
+    world_size: int,
+    pin_mem: bool,
+):
     sampler = None
     if distributed:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
-                                     shuffle=shuffle, drop_last=drop_last)
-    loader = _make_loader(dataset,
-                          shuffle=shuffle, drop_last=drop_last, batch_size=batch_size,
-                          n_workers=n_workers, pin_mem=pin_mem, sampler=sampler)
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            drop_last=drop_last,
+        )
+    loader = _make_loader(
+        dataset,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        batch_size=batch_size,
+        n_workers=n_workers,
+        pin_mem=pin_mem,
+        sampler=sampler,
+    )
     return loader, sampler
+
+
+def _make_latent_train_loader(
+    train_ds,
+    *,
+    batch_size: int,
+    n_workers: int,
+    distributed: bool,
+    rank: int,
+    world_size: int,
+    pin_mem: bool,
+):
+    """
+    Independent train stream for latent diffusion updates.
+    Uses a separate DistributedSampler so successive k-steps see fresh batches.
+    """
+    lat_sampler = None
+    if distributed:
+        lat_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+        )
+    lat_loader = _make_loader(
+        train_ds,
+        shuffle=True,
+        drop_last=True,
+        batch_size=batch_size,
+        n_workers=n_workers,
+        pin_mem=pin_mem,
+        sampler=lat_sampler,
+    )
+    return lat_loader, lat_sampler
+
+
+def _build_all_loaders(
+    *,
+    train_ds,
+    val_ds,
+    test_ds,
+    bs: int,
+    workers: int,
+    pin_mem: bool,
+    distributed: bool,
+    rank: int,
+    world_size: int,
+    return_latent_loader: bool,
+    latent_bs: Optional[int],
+):
+    train_loader, train_sampler = _maybe_sampler(
+        train_ds,
+        shuffle=True,
+        drop_last=True,
+        batch_size=bs,
+        n_workers=workers,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
+        pin_mem=pin_mem,
+    )
+    val_loader, val_sampler = _maybe_sampler(
+        val_ds,
+        shuffle=False,
+        drop_last=False,
+        batch_size=bs,
+        n_workers=workers,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
+        pin_mem=pin_mem,
+    )
+    test_loader, test_sampler = _maybe_sampler(
+        test_ds,
+        shuffle=False,
+        drop_last=False,
+        batch_size=bs,
+        n_workers=workers,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
+        pin_mem=pin_mem,
+    )
+
+    train_lat_loader = None
+    lat_sampler = None
+    if return_latent_loader:
+        lat_bs_eff = int(latent_bs) if latent_bs is not None else bs
+        train_lat_loader, lat_sampler = _make_latent_train_loader(
+            train_ds,
+            batch_size=lat_bs_eff,
+            n_workers=workers,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            pin_mem=pin_mem,
+        )
+
+    samplers: Dict[str, Optional[DistributedSampler]] = {
+        "train": train_sampler,
+        "val": val_sampler,
+        "test": test_sampler,
+        "latent": lat_sampler,
+    }
+    return train_loader, train_lat_loader, val_loader, test_loader, samplers
 
 
 def get_dataloaders(
@@ -108,14 +246,28 @@ def get_dataloaders(
     distributed: bool = False,
     rank: int = 0,
     world_size: int = 1,
-    return_samplers: bool = False,  # NEW: default False keeps old 3-return behavior
+    return_samplers: bool = False,
+    return_latent_loader: bool = False,
 ) -> Union[
     Tuple[DataLoader, DataLoader, DataLoader],
-    Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Optional[DistributedSampler]]]
+    Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Optional[DistributedSampler]]],
+    Tuple[DataLoader, DataLoader, DataLoader, DataLoader],
+    Tuple[DataLoader, DataLoader, DataLoader, DataLoader, Dict[str, Optional[DistributedSampler]]],
 ]:
-    name, bs = args.dataset, args.batch_size
+    """
+    Returns:
+      - default: (train_loader, val_loader, test_loader)
+      - if return_samplers: (..., samplers_dict)
+      - if return_latent_loader: (train_loader, train_loader_lat, val_loader, test_loader)
+      - if both: (train_loader, train_loader_lat, val_loader, test_loader, samplers_dict)
+    """
+    name = args.dataset
+    bs = int(args.batch_size)
 
-    samplers: Dict[str, Optional[DistributedSampler]] = {"train": None, "val": None, "test": None}
+    workers = int(getattr(args, "n_workers", 4))
+    pin_mem = bool(getattr(args, "pin_memory", torch.cuda.is_available()))
+    latent_bs = getattr(args, "latent_batch_size", None)
+    latent_bs = int(latent_bs) if latent_bs is not None else None
 
     # ───────────────── rendered datasets (old + new) ─────────────────
     if name in {"rendered_so_dataset", "rendered_teapots"}:
@@ -123,44 +275,34 @@ def get_dataloaders(
             if RenderedSO3Dataset is None:
                 raise ImportError("RenderedSO3Dataset requires pytorch3d, which is not installed.")
             dataset_cls = RenderedSO3Dataset
-        elif name == "rendered_teapots":
+        else:
             if RenderedTeapots is None:
                 raise ImportError("RenderedTeapots dataset not available.")
             dataset_cls = RenderedTeapots
-        dataset = dataset_cls(args, seed=seed)
 
-        g = torch.Generator().manual_seed(seed)
-        n = len(dataset)
-        train_len = int(0.9 * n)
-        val_len   = int(0.05 * n)
-        test_len  = n - train_len - val_len
-        train_ds, val_ds, test_ds = random_split(dataset, [train_len, val_len, test_len], generator=g)
+        full = dataset_cls(args, seed=seed)
+        train_ds, val_ds, test_ds = _split_3way(full, train_frac=0.9, val_frac=0.05, seed=seed)
 
-        workers = getattr(args, "n_workers", 4)
-        pin_mem = torch.cuda.is_available()
-
-        train_loader, train_sampler = _maybe_sampler(
-            train_ds, shuffle=True, drop_last=True, batch_size=bs, n_workers=workers,
-            distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
+        train_loader, train_loader_lat, val_loader, test_loader, samplers = _build_all_loaders(
+            train_ds=train_ds,
+            val_ds=val_ds,
+            test_ds=test_ds,
+            bs=bs,
+            workers=workers,
+            pin_mem=pin_mem,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            return_latent_loader=return_latent_loader,
+            latent_bs=latent_bs,
         )
-        val_loader, val_sampler = _maybe_sampler(
-            val_ds, shuffle=False, drop_last=False, batch_size=bs, n_workers=workers,
-            distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
-        )
-        test_loader, test_sampler = _maybe_sampler(
-            test_ds, shuffle=False, drop_last=False, batch_size=bs, n_workers=workers,
-            distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
-        )
-
-        samplers.update({"train": train_sampler, "val": val_sampler, "test": test_sampler})
-        return (train_loader, val_loader, test_loader, samplers) if return_samplers \
-            else (train_loader, val_loader, test_loader)
 
     # ───────────────── Rotated MNIST (SO(2) pad→rotate) ─────────────────
     elif name in {"rotated_mnist_dataset", "rotated_mnist"}:
         if RotatedMNIST is None:
             raise ImportError("datasets/rotated_mnist_dataset.py not found or failed to import.")
-        ds = RotatedMNIST(
+
+        full = RotatedMNIST(
             dataset_path=args.dataset_path,
             digit=getattr(args, "digit", 9),
             split=getattr(args, "split", "train"),
@@ -175,119 +317,152 @@ def get_dataloaders(
             pad_to_32=getattr(args, "pad_to_32", True),
             seed=seed,
         )
+        train_ds, val_ds, test_ds = _split_3way(full, train_frac=0.9, val_frac=0.05, seed=seed)
 
-        g = torch.Generator().manual_seed(seed)
-        n = len(ds)
-        train_len = int(0.9 * n)
-        val_len   = int(0.05 * n)
-        test_len  = n - train_len - val_len
-        train_ds, val_ds, test_ds = random_split(ds, [train_len, val_len, test_len], generator=g)
-
-        workers = getattr(args, "n_workers", 8)
-        pin_mem = torch.cuda.is_available()
-
-        train_loader, train_sampler = _maybe_sampler(
-            train_ds, shuffle=True, drop_last=True, batch_size=bs, n_workers=workers,
-            distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
+        train_loader, train_loader_lat, val_loader, test_loader, samplers = _build_all_loaders(
+            train_ds=train_ds,
+            val_ds=val_ds,
+            test_ds=test_ds,
+            bs=bs,
+            workers=workers,
+            pin_mem=pin_mem,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            return_latent_loader=return_latent_loader,
+            latent_bs=latent_bs,
         )
-        val_loader, val_sampler = _maybe_sampler(
-            val_ds, shuffle=False, drop_last=False, batch_size=bs, n_workers=workers,
-            distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
-        )
-        test_loader, test_sampler = _maybe_sampler(
-            test_ds, shuffle=False, drop_last=False, batch_size=bs, n_workers=workers,
-            distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
-        )
-
-        samplers.update({"train": train_sampler, "val": val_sampler, "test": test_sampler})
-        return (train_loader, val_loader, test_loader, samplers) if return_samplers \
-            else (train_loader, val_loader, test_loader)
 
     # ───────────────── Analytic S^2 / T^2 (no 3D; exact geodesics) ─────────────────
     elif name in {"analytic_manifold_dataset", "analytic_manifold"}:
         if AnalyticManifoldDataset is None:
             raise ImportError("datasets/analytic_manifold_dataset.py not found or failed to import.")
-        ds = AnalyticManifoldDataset(args, seed=seed)
 
-        g = torch.Generator().manual_seed(seed)
-        n = len(ds)
-        train_len = int(0.9 * n)
-        val_len   = int(0.05 * n)
-        test_len  = n - train_len - val_len
-        train_ds, val_ds, test_ds = random_split(ds, [train_len, val_len, test_len], generator=g)
+        full = AnalyticManifoldDataset(args, seed=seed)
+        train_ds, val_ds, test_ds = _split_3way(full, train_frac=0.9, val_frac=0.05, seed=seed)
 
-        workers = getattr(args, "n_workers", 8)
-        pin_mem = torch.cuda.is_available()
-
-        train_loader, train_sampler = _maybe_sampler(
-            train_ds, shuffle=True, drop_last=True, batch_size=bs, n_workers=workers,
-            distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
-        )
-        val_loader, val_sampler = _maybe_sampler(
-            val_ds, shuffle=False, drop_last=False, batch_size=bs, n_workers=workers,
-            distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
-        )
-        test_loader, test_sampler = _maybe_sampler(
-            test_ds, shuffle=False, drop_last=False, batch_size=bs, n_workers=workers,
-            distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
+        train_loader, train_loader_lat, val_loader, test_loader, samplers = _build_all_loaders(
+            train_ds=train_ds,
+            val_ds=val_ds,
+            test_ds=test_ds,
+            bs=bs,
+            workers=workers,
+            pin_mem=pin_mem,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            return_latent_loader=return_latent_loader,
+            latent_bs=latent_bs,
         )
 
-        samplers.update({"train": train_sampler, "val": val_sampler, "test": test_sampler})
-        return (train_loader, val_loader, test_loader, samplers) if return_samplers \
-            else (train_loader, val_loader, test_loader)
-    
-    # ───────────────────── lightweight branches (unchanged) ───────────────────
+    # ───────────────── sphere / earth / so / MNIST / CIFAR10 ─────────────────
     elif name == "sphere":
-        train_ds, val_ds, test_ds = random_split(
-            KSphereDataset(args, seed=seed),
-            [int(0.9*len(args)), int(0.05*len(args)), int(0.05*len(args))],
-            generator=torch.Generator().manual_seed(seed),
+        full = KSphereDataset(args, seed=seed)
+        train_ds, val_ds, test_ds = _split_3way(full, train_frac=0.9, val_frac=0.05, seed=seed)
+
+        train_loader, train_loader_lat, val_loader, test_loader, samplers = _build_all_loaders(
+            train_ds=train_ds,
+            val_ds=val_ds,
+            test_ds=test_ds,
+            bs=bs,
+            workers=workers,
+            pin_mem=pin_mem,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            return_latent_loader=return_latent_loader,
+            latent_bs=latent_bs,
         )
+
     elif name == "earth":
-        train_ds, val_ds, test_ds = random_split(
-            EarthDataset(args),
-            [int(0.9*len(args)), int(0.05*len(args)), int(0.05*len(args))],
-            generator=torch.Generator().manual_seed(seed),
+        full = EarthDataset(args)
+        train_ds, val_ds, test_ds = _split_3way(full, train_frac=0.9, val_frac=0.05, seed=seed)
+
+        train_loader, train_loader_lat, val_loader, test_loader, samplers = _build_all_loaders(
+            train_ds=train_ds,
+            val_ds=val_ds,
+            test_ds=test_ds,
+            bs=bs,
+            workers=workers,
+            pin_mem=pin_mem,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            return_latent_loader=return_latent_loader,
+            latent_bs=latent_bs,
         )
+
     elif name == "so":
         full = SOdataset(args, seed=seed)
-        g = torch.Generator().manual_seed(seed)
-        n = len(full)
-        train_len = int(0.9 * n)
-        val_len   = int(0.05 * n)
-        test_len  = n - train_len - val_len
-        train_ds, val_ds, test_ds = random_split(full, [train_len, val_len, test_len], generator=g)
+        train_ds, val_ds, test_ds = _split_3way(full, train_frac=0.9, val_frac=0.05, seed=seed)
+
+        train_loader, train_loader_lat, val_loader, test_loader, samplers = _build_all_loaders(
+            train_ds=train_ds,
+            val_ds=val_ds,
+            test_ds=test_ds,
+            bs=bs,
+            workers=workers,
+            pin_mem=pin_mem,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            return_latent_loader=return_latent_loader,
+            latent_bs=latent_bs,
+        )
+
     elif name == "MNIST":
         tfm = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
-        full    = datasets.MNIST("./datasets", train=True,  transform=tfm, download=True)
+        full_train = datasets.MNIST("./datasets", train=True, transform=tfm, download=True)
         test_ds = datasets.MNIST("./datasets", train=False, transform=tfm, download=True)
-        train_ds, val_ds = _split(full, seed=seed)
+        train_ds, val_ds = _split_2way(full_train, train_frac=0.9, seed=seed)
+
+        train_loader, train_loader_lat, val_loader, test_loader, samplers = _build_all_loaders(
+            train_ds=train_ds,
+            val_ds=val_ds,
+            test_ds=test_ds,
+            bs=bs,
+            workers=workers,
+            pin_mem=pin_mem,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            return_latent_loader=return_latent_loader,
+            latent_bs=latent_bs,
+        )
+
     elif name == "CIFAR10":
-        tfm = transforms.Compose([transforms.ToTensor(),
-                                  transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-        full    = datasets.CIFAR10("./datasets", train=True,  transform=tfm, download=True)
+        tfm = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]
+        )
+        full_train = datasets.CIFAR10("./datasets", train=True, transform=tfm, download=True)
         test_ds = datasets.CIFAR10("./datasets", train=False, transform=tfm, download=True)
-        train_ds, val_ds = _split(full, seed=seed)
+        train_ds, val_ds = _split_2way(full_train, train_frac=0.9, seed=seed)
+
+        train_loader, train_loader_lat, val_loader, test_loader, samplers = _build_all_loaders(
+            train_ds=train_ds,
+            val_ds=val_ds,
+            test_ds=test_ds,
+            bs=bs,
+            workers=workers,
+            pin_mem=pin_mem,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            return_latent_loader=return_latent_loader,
+            latent_bs=latent_bs,
+        )
+
     else:
         raise ValueError(f"Unsupported dataset: {name}")
 
-    workers = getattr(args, "n_workers", 4)
-    pin_mem = torch.cuda.is_available()
-
-    train_loader, train_sampler = _maybe_sampler(
-        train_ds, shuffle=True, drop_last=True, batch_size=bs, n_workers=workers,
-        distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
-    )
-    val_loader, val_sampler = _maybe_sampler(
-        val_ds, shuffle=False, drop_last=False, batch_size=bs, n_workers=workers,
-        distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
-    )
-    test_loader, test_sampler = _maybe_sampler(
-        test_ds, shuffle=False, drop_last=False, batch_size=bs, n_workers=workers,
-        distributed=distributed, rank=rank, world_size=world_size, pin_mem=pin_mem
-    )
-
-    samplers.update({"train": train_sampler, "val": val_sampler, "test": test_sampler})
-    return (train_loader, val_loader, test_loader, samplers) if return_samplers \
-        else (train_loader, val_loader, test_loader)
-
+    # ---------------- return policy (backward compatible) ----------------
+    if return_latent_loader and return_samplers:
+        return train_loader, train_loader_lat, val_loader, test_loader, samplers
+    if return_latent_loader and (not return_samplers):
+        return train_loader, train_loader_lat, val_loader, test_loader
+    if return_samplers:
+        return train_loader, val_loader, test_loader, samplers
+    return train_loader, val_loader, test_loader
